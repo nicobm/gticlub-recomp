@@ -37,7 +37,8 @@
                 },
                 {
                     "type": "dir",
-                    "path": "game-data"
+                    "path": "game-data",
+                    "dest": "game-data"
                 },
                 {
                     "type": "file",

@@ -18,6 +18,7 @@ src/recomp/spu_gen/
 build-gti/
 game-data/
 .flatpak/
+.flatpak-builder/
 .flatpak-build/
 .flatpak-repo/
 *.pkg

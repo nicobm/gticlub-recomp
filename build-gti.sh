@@ -8,19 +8,25 @@
 #   bash build-gti.sh "GTI Club Rally Cote D'Azur PSN [NPEB-00060].zip"
 #
 # El primer argumento puede ser el .rar/.zip del juego o una carpeta ya
-# extraída (NPEB00060). Si no se pasa nada, se busca en ~/Documentos.
+# extraída (NPEB00060). Si no se pasa nada, se busca en XDG Documents/Downloads.
 #
 # Variables opcionales:
 #   GTI_ROM=/ruta/al/juego.rar   archivo del juego (si no se autodetecta)
 #   GTI_DATA=/ruta/NPEB00060     datos ya extraídos (evita extraer el .rar)
 #   GTI_TOOLBOX=fedora-toolbox-43  contenedor de Toolbox a usar
+#   GTI_FLATPAK_SCOPE=auto|system|user
+#                                instalar runtimes/Flatpak en el sistema o en
+#                                el usuario (auto: sistema si existe flathub)
 #
-# El script se re-ejecuta dentro de Toolbox. Dentro pregunta antes de instalar
-# paquetes con sudo dnf y antes de instalar los runtimes de Flathub.
+# El build se ejecuta dentro de Toolbox; la instalación del Flatpak se hace
+# desde el host, donde sí se ve el flathub del sistema de Silverblue/Bazzite.
+# Pregunta antes de instalar paquetes con sudo dnf (Toolbox) y antes de
+# instalar los runtimes de Flathub (host).
 set -Eeuo pipefail
 
 APP_ID="io.github.nicobm.GtiClubRecomp"
 LOCAL_REMOTE="gticlub-local"
+FLATPAK_SCOPE="${GTI_FLATPAK_SCOPE:-auto}"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
@@ -230,13 +236,22 @@ host_stage() {
     fi
   fi
 
+  resolve_host_flatpak_scope
+  install_host_flatpak_dependencies
+
   say "Entrando en Toolbox ($container)"
-  exec toolbox run -c "$container" -- env \
-    GTI_IN_TOOLBOX=1 \
-    GTI_REPO="$REPO_DIR" \
-    GTI_ROM="${GTI_ROM:-}" \
-    GTI_DATA="${GTI_DATA:-}" \
-    bash "$SCRIPT_PATH"
+  if ! toolbox run -c "$container" -- env \
+      GTI_IN_TOOLBOX=1 \
+      GTI_BUILD_ONLY=1 \
+      GTI_REPO="$REPO_DIR" \
+      GTI_ROM="${GTI_ROM:-}" \
+      GTI_DATA="${GTI_DATA:-}" \
+      bash "$SCRIPT_PATH"; then
+    die "La compilación dentro de Toolbox falló."
+  fi
+
+  install_host_flatpak_app
+  print_summary
 }
 
 # ------------------------------------------------------------- toolbox stage
@@ -642,68 +657,183 @@ O pásale los datos ya extraídos con:
   printf 'Datos listos en %s\n' "$GAME_DATA_DIR"
 }
 
-flatpak_ref_installed_user() {
-  flatpak info --user "$1" >/dev/null 2>&1
+# ---------------------------------------------------------------------- Flatpak
+# El build se hace dentro de Toolbox, que solo comparte la instalación de
+# usuario de Flatpak. Los runtimes de usuario para el build y los del sistema
+# para ejecutar el juego se instalan desde el host, donde sí se ve el flathub
+# del sistema que trae Silverblue/Bazzite.
+
+TEMP_USER_REMOTE=""
+
+disable_temp_user_remote() {
+  # No se borra: los refs instalados desde él seguirían apuntando a un remoto
+  # inexistente. Se desactiva, como el remoto local de senjin-recomped.
+  if [[ -n "$TEMP_USER_REMOTE" ]]; then
+    flatpak remote-modify --user --disable "$TEMP_USER_REMOTE" >/dev/null 2>&1 || true
+    TEMP_USER_REMOTE=""
+  fi
 }
 
-install_flatpak_dependencies() {
-  say "Comprobando runtimes de Flatpak"
-  local -a missing=()
-  local ref
+resolve_host_flatpak_scope() {
+  if [[ "${FLATPAK_SCOPE_DONE:-0}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "$FLATPAK_SCOPE" == "auto" ]]; then
+    if flatpak remotes --system --columns=name 2>/dev/null | grep -qx flathub; then
+      FLATPAK_SCOPE="system"
+    else
+      FLATPAK_SCOPE="user"
+    fi
+  fi
+  case "$FLATPAK_SCOPE" in
+    system|user) ;;
+    *) die "GTI_FLATPAK_SCOPE debe ser auto, system o user." ;;
+  esac
+  if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+    say "Flatpak: el juego se instalará en el sistema (flathub del sistema)"
+  else
+    say "Flatpak: el juego se instalará en el usuario (flathub del usuario)"
+  fi
+  FLATPAK_SCOPE_DONE=1
+}
+
+host_flatpak_ref_installed() {
+  if [[ "$1" == "system" ]]; then
+    flatpak info --system "$2" >/dev/null 2>&1
+  else
+    flatpak info --user "$2" >/dev/null 2>&1
+  fi
+}
+
+USER_FLATHUB_REMOTE=""
+
+user_flathub_remote() {
+  # Deja en USER_FLATHUB_REMOTE un remoto flathub de usuario. Si no existe,
+  # añade uno temporal (se borra al salir) para no dejar un "flathub" de
+  # usuario permanente. No se llama en una subshell: TEMP_USER_REMOTE debe
+  # quedar en el proceso padre para que el trap pueda borrarlo.
+  if flatpak remotes --user --columns=name 2>/dev/null | grep -qx flathub; then
+    USER_FLATHUB_REMOTE="flathub"
+    return 0
+  fi
+  if [[ -z "$TEMP_USER_REMOTE" ]]; then
+    TEMP_USER_REMOTE="gticlub-build-flathub"
+    if flatpak remotes --user --show-disabled --columns=name 2>/dev/null | grep -qx "$TEMP_USER_REMOTE"; then
+      flatpak remote-modify --user --enable "$TEMP_USER_REMOTE" >/dev/null ||
+        die "No se pudo habilitar el remoto de build $TEMP_USER_REMOTE."
+    else
+      flatpak remote-add --if-not-exists --user "$TEMP_USER_REMOTE" \
+        https://flathub.org/repo/flathub.flatpakrepo >/dev/null ||
+        die "No se pudo añadir el remoto de build de Flathub."
+    fi
+  fi
+  USER_FLATHUB_REMOTE="$TEMP_USER_REMOTE"
+}
+
+install_host_flatpak_dependencies() {
+  resolve_host_flatpak_scope
+
+  local -a system_missing=() user_missing=()
+  local ref found i
+
+  # Lo que necesita la app al ejecutarse en la instalación elegida.
+  for ref in \
+    "org.freedesktop.Platform//26.08" \
+    "org.winehq.Wine//stable-26.08"; do
+    if ! host_flatpak_ref_installed "$FLATPAK_SCOPE" "$ref"; then
+      if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+        system_missing+=("$ref")
+      else
+        user_missing+=("$ref")
+      fi
+    fi
+  done
+
+  # El build dentro de Toolbox usa siempre la instalación de usuario: necesita
+  # también el SDK y la base app de Wine de usuario.
   for ref in \
     "org.freedesktop.Platform//26.08" \
     "org.freedesktop.Sdk//26.08" \
     "org.winehq.Wine//stable-26.08"; do
-    if ! flatpak_ref_installed_user "$ref"; then
-      missing+=("$ref")
+    if ! flatpak info --user "$ref" >/dev/null 2>&1; then
+      found=0
+      for i in "${user_missing[@]}"; do
+        [[ "$i" == "$ref" ]] && found=1
+      done
+      ((found == 0)) && user_missing+=("$ref")
     fi
   done
 
-  if ((${#missing[@]} == 0)); then
-    printf 'Los runtimes necesarios ya están instalados.\n'
+  if ((${#system_missing[@]} == 0 && ${#user_missing[@]} == 0)); then
+    printf 'Los runtimes de Flatpak necesarios ya están instalados.\n'
     return 0
   fi
 
   printf 'Faltan estos runtimes de Flathub:\n'
-  printf '  - %s\n' "${missing[@]}"
-  printf 'Wine se usa como aplicación base (base app) para ejecutar el .exe.\n'
+  if ((${#system_missing[@]} > 0)); then
+    printf '  [sistema, para jugar] %s\n' "${system_missing[@]}"
+  fi
+  if ((${#user_missing[@]} > 0)); then
+    printf '  [usuario, para el build en Toolbox] %s\n' "${user_missing[@]}"
+  fi
+  printf 'El build se hace en Toolbox con los runtimes de usuario.\n'
   if ! ask_yes_no "¿Instalar el runtime/deps de Flathub?"; then
-    die "Sin esos runtimes no se puede construir ni ejecutar el Flatpak.
-Instálalos manualmente con:
-  flatpak remote-add --if-not-exists --user flathub https://flathub.org/repo/flathub.flatpakrepo
-  flatpak install --user flathub ${missing[*]}"
+    die "Sin esos runtimes no se puede construir ni ejecutar el Flatpak."
   fi
 
-  if ! flatpak remotes --user --columns=name 2>/dev/null | grep -qx flathub; then
-    say "Añadiendo el remoto Flathub (usuario)"
-    flatpak remote-add --if-not-exists --user flathub \
-      https://flathub.org/repo/flathub.flatpakrepo
+  # Si hay que crear un flathub de build de usuario, se desactiva al salir.
+  trap disable_temp_user_remote EXIT
+
+  if ((${#system_missing[@]} > 0)); then
+    flatpak install -y --system flathub "${system_missing[@]}" ||
+      die "No se pudieron instalar los runtimes en el sistema.
+Puedes forzar la instalación de usuario con:
+  GTI_FLATPAK_SCOPE=user bash build-gti.sh"
   fi
 
-  flatpak install -y --user flathub "${missing[@]}" ||
-    die "Flatpak no pudo instalar los runtimes necesarios."
+  if ((${#user_missing[@]} > 0)); then
+    user_flathub_remote
+    flatpak install -y --user "$USER_FLATHUB_REMOTE" "${user_missing[@]}" ||
+      die "No se pudieron instalar los runtimes de usuario para el build."
+  fi
 }
 
-build_and_install_flatpak() {
-  say "Construyendo el Flatpak (puede tardar varios minutos)"
-  [[ -f "$MANIFEST" ]] || die "No encuentro el manifiesto $MANIFEST."
-  mkdir -p "$WORK_DIR"
+install_host_flatpak_app() {
+  resolve_host_flatpak_scope
+  [[ -d "$WORK_DIR/repo" ]] ||
+    die "No encuentro el repositorio Flatpak construido en $WORK_DIR/repo."
 
-  (
-    cd "$REPO_DIR"
-    flatpak-builder --user --force-clean --disable-rofiles-fuse \
-      --repo="$WORK_DIR/repo" "$WORK_DIR/build-dir" "$MANIFEST"
-  ) || die "flatpak-builder falló. Revisa el mensaje anterior."
+  if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+    # Una instalación del sistema no necesita un remoto local permanente (y el
+    # daemon de Flatpak puede tener problemas para leer un repo dentro de
+    # $HOME). Exportamos un bundle y lo instalamos desde /var/tmp.
+    local bundle="/var/tmp/gticlub-$APP_ID.flatpak"
+    rm -f "$bundle"
+    flatpak build-bundle --arch=x86_64 "$WORK_DIR/repo" "$bundle" "$APP_ID" master ||
+      die "No se pudo crear el bundle del Flatpak."
+    flatpak install --system --reinstall --noninteractive "$bundle" ||
+      die "No se pudo instalar el Flatpak en el sistema.
+Puedes forzar la instalación de usuario con:
+  GTI_FLATPAK_SCOPE=user bash build-gti.sh"
+    rm -f "$bundle"
 
+    flatpak list --system --app --columns=application 2>/dev/null | grep -qx "$APP_ID" ||
+      die "El Flatpak se construyó pero no aparece instalado en el sistema."
+    return 0
+  fi
+
+  # Instalación de usuario: remoto local, como senjin-recomped.
   local repo_uri
   repo_uri="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$WORK_DIR/repo")"
 
   if flatpak remotes --user --show-disabled --columns=name 2>/dev/null | grep -qx "$LOCAL_REMOTE"; then
     flatpak remote-modify --user --no-gpg-verify --no-use-for-deps --enumerate \
-      --enable --url="$repo_uri" "$LOCAL_REMOTE"
+      --enable --url="$repo_uri" "$LOCAL_REMOTE" ||
+      die "No se pudo modificar el remoto local de usuario."
   else
     flatpak remote-add --user --no-gpg-verify --no-use-for-deps \
-      "$LOCAL_REMOTE" "$repo_uri"
+      "$LOCAL_REMOTE" "$repo_uri" ||
+      die "No se pudo añadir el remoto local de usuario."
   fi
 
   local -a refs=()
@@ -721,12 +851,69 @@ build_and_install_flatpak() {
   flatpak install --user --reinstall --noninteractive "$LOCAL_REMOTE" "${refs[@]}" ||
     die "No se pudo instalar el Flatpak desde el repositorio local."
 
-  # Es una compilación local: flatpak update no tiene nada que buscar.
   flatpak remote-modify --user --disable "$LOCAL_REMOTE" ||
     printf 'Aviso: no se pudo desactivar el remoto %s.\n' "$LOCAL_REMOTE" >&2
 
   flatpak list --user --app --columns=application 2>/dev/null | grep -qx "$APP_ID" ||
     die "El Flatpak se construyó pero no aparece instalado."
+}
+
+print_summary() {
+  if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+    cat <<EOF
+Racing Club+ está instalado como Flatpak del sistema:
+
+  flatpak run $APP_ID
+
+También aparece en el menú de aplicaciones como "Racing Club+".
+Los datos y las partidas de tu usuario se guardan en:
+  ~/.var/app/$APP_ID/data/racing-club/game
+
+Para desinstalarlo:
+  flatpak uninstall --system $APP_ID
+EOF
+  else
+    cat <<EOF
+Racing Club+ está instalado como Flatpak de usuario:
+
+  flatpak run $APP_ID
+
+También aparece en el menú de aplicaciones como "Racing Club+".
+Los datos y las partidas se guardan en:
+  ~/.var/app/$APP_ID/data/racing-club/game
+
+Para desinstalarlo:
+  flatpak uninstall --user $APP_ID
+  flatpak remote-delete --user --force $LOCAL_REMOTE
+EOF
+  fi
+}
+
+# ----------------------------------------------------------------------- build
+
+build_flatpak_repo() {
+  say "Construyendo el Flatpak (puede tardar varios minutos)"
+  [[ -f "$MANIFEST" ]] || die "No encuentro el manifiesto $MANIFEST."
+  mkdir -p "$WORK_DIR"
+
+  # Dentro de Toolbox solo se ve la instalación de usuario de Flatpak. El host
+  # ya instaló aquí el SDK, el runtime y la base app de Wine.
+  local ref
+  for ref in \
+    "org.freedesktop.Platform//26.08" \
+    "org.freedesktop.Sdk//26.08" \
+    "org.winehq.Wine//stable-26.08"; do
+    flatpak info --user "$ref" >/dev/null 2>&1 ||
+      die "Falta $ref en la instalación de usuario de Flatpak.
+Vuelve a ejecutar el script desde el host para que instale los runtimes."
+  done
+
+  (
+    cd "$REPO_DIR"
+    flatpak-builder --user --force-clean --disable-rofiles-fuse \
+      --state-dir="$WORK_DIR/state" \
+      --repo="$WORK_DIR/repo" "$WORK_DIR/build-dir" "$MANIFEST"
+  ) || die "flatpak-builder falló. Revisa el mensaje anterior."
 }
 
 toolbox_stage() {
@@ -740,23 +927,8 @@ toolbox_stage() {
   require_commands
   build_windows_exe
   prepare_game_data
-  install_flatpak_dependencies
-  build_and_install_flatpak
-
-  say "Listo"
-  cat <<EOF
-Racing Club+ está instalado como Flatpak de usuario:
-
-  flatpak run $APP_ID
-
-También aparece en el menú de aplicaciones como "Racing Club+".
-Los datos y las partidas se guardan en:
-  ~/.var/app/$APP_ID/data/racing-club/game
-
-Para desinstalarlo:
-  flatpak uninstall $APP_ID
-  flatpak remote-delete --user $LOCAL_REMOTE
-EOF
+  build_flatpak_repo
+  say "Compilación terminada; el host instalará el Flatpak."
 }
 
 case "${1:-}" in
