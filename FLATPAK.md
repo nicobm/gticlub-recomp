@@ -178,7 +178,10 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   autor: `--env=RACING_CLUB_KEEP_GLCACHE=1`.
 - El juego es un `.exe` de Windows: SDL crea el contexto con **WGL**, que Wine
   traduce al driver **Wayland** (preferido) o X11 (fallback). El manifiesto
-  usa `--socket=wayland` y `--socket=fallback-x11`; no se fuerza X11.
+  usa `--socket=wayland` y `--socket=fallback-x11`. Flatpak puede exponer
+  `DISPLAY=:0` junto con `WAYLAND_DISPLAY`; el lanzador quita `DISPLAY` si
+  hay Wayland para que Wine no elija X11. Sin Wayland, `DISPLAY` queda como
+  fallback.
 - En una VM con **Virtio GPU** sin aceleración 3D (virgl) no hay GL por
   hardware real: el juego cae a software (llvmpipe), que funciona pero es
   lento. Para hardware hace falta `virtio-gpu-gl`/virgl en el host, una GPU

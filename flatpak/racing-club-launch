@@ -64,10 +64,12 @@ elif [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ] && [ ! -e "$GAME_DIR/.glcache-c
     rm -rf "$GAME_DIR/glcache"
     : > "$GAME_DIR/.glcache-cleaned"
 fi
-# Wayland es la vía principal; X11 queda solo como fallback (Flatpak expone
-# DISPLAY únicamente si no hay Wayland). No forzamos uno ni el otro: Wine
-# elige el driver disponible.
+# Wayland es la vía principal; X11 queda solo como fallback. Flatpak puede
+# exponer DISPLAY=:0 junto con WAYLAND_DISPLAY (XWayland), y en ese caso Wine
+# elige X11. Si hay Wayland, quitamos DISPLAY para que use el driver Wayland;
+# si no hay Wayland, DISPLAY queda para el fallback X11.
 if [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    unset DISPLAY
     echo "Racing Club+: Wine sobre Wayland."
 elif [ -n "${DISPLAY:-}" ]; then
     echo "Racing Club+: Wine sobre X11 (fallback)."
