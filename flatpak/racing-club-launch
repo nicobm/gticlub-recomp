@@ -28,6 +28,18 @@ fi
 export WINEPREFIX="$DATA_HOME/wineprefix"
 export WINEARCH=win64
 export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
+
+# El GL por hardware de este Flatpak falla en algunas AMD/Mesa; llvmpipe
+# abre el juego. Se puede forzar hardware con RACING_CLUB_SOFTWARE_GL=0.
+if [ "${RACING_CLUB_SOFTWARE_GL:-1}" = "1" ]; then
+    export LIBGL_ALWAYS_SOFTWARE=1
+fi
+
+# El glcache del paquete es de la GPU del autor; en otra GPU conviene
+# borrarlo y dejar que el juego regenere los shaders.
+if [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ]; then
+    rm -rf "$GAME_DIR/glcache"
+fi
 # El juego usa OpenGL. winevulkan=d evita que Wine intente radv/Vulkan.
 export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d}"
 
