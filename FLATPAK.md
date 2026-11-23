@@ -162,5 +162,31 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   que puedas pasarlo, pero no se extrae.
 - Los mensajes `MESA/radv` de Vulkan son ruido; el juego usa OpenGL y el
   lanzador desactiva `winevulkan`.
+- El lanzador usa **OpenGL por software** por defecto (`LIBGL_ALWAYS_SOFTWARE=1`)
+  porque en algunas AMD/Mesa el GL por hardware del Flatpak falla. Es lento;
+  para probar hardware:
+  ```sh
+  flatpak run --user --env=RACING_CLUB_SOFTWARE_GL=0 \
+      io.github.nicobm.GtiClubRecomp
+  ```
+  No uses `flatpak override`: cambia la configuración para todas las
+  ejecuciones. El `--env` de una sola corrida es suficiente.
+- El `glcache` del paquete es de la GPU del autor; el lanzador lo borra y el
+  juego regenera los shaders. Si querés conservarlo:
+  `--env=RACING_CLUB_KEEP_GLCACHE=1`.
+- El script ajusta `gtiport.ini` a 720p/60 con `antialiasing=1` y `nitidez=1`.
+  Eso fuerza el *present* por shader; con ambos en 0 el juego usa
+  `glBlitFramebuffer`, que en AMD/Mesa deja la ventana en blanco. El
+  antialiasing anisotrópico queda en 0 para aliviar el software. Después se
+  cambia desde el menú **F1**.
+- Si después de actualizar el Flatpak seguís viendo todo blanco, borrá el ini
+  de tu carpeta de usuario y volvé a arrancar para que se copie el nuevo:
+  ```sh
+  rm -f ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club/game/gtiport.ini
+  ```
+- El render por hardware en algunas AMD/Mesa puede seguir mostrando blanco
+  aunque el *present* sea por shader: es el renderer RSX del juego, no el
+  Flatpak. En ese caso el modo software muestra los logos (lento) hasta que
+  se parchee `rsx_gl` y se recompile el juego.
 - El Flatpak contiene datos del juego de tu paquete de Patreon. Es para uso
   personal: no redistribuyas el paquete ni `prebuilt/`.

@@ -378,15 +378,16 @@ tune_prebuilt_ini() {
   # El ini del autor viene en 4K/fullscreen/72 Hz; en otra GPU eso puede
   # quedar en negro o comer CPU. Arrancamos en ventana 720p/60 y se cambia
   # desde el menú F1 del juego.
+  #
+  # AA/sharpen en 1 fuerza el present por shader. Con ambos en 0 se usa
+  # glBlitFramebuffer directo, que en AMD/Mesa (y llvmpipe) deja la ventana
+  # blanca; con el shader se ven los logos (aunque el hardware AMD siga
+  # fallando por el renderer RSX).
   sed -i \
     -e 's/^pantalla_completa=.*/pantalla_completa=0/' \
     -e 's/^resolucion_interna=.*/resolucion_interna=0/' \
     -e 's/^imagenes_por_segundo=.*/imagenes_por_segundo=60/' \
     -e 's/^pantalla_120hz=.*/pantalla_120hz=0/' \
-    # AA/sharpen en 1 fuerza el present por shader. Con ambos en 0 se usa
-    # glBlitFramebuffer directo, que en AMD/Mesa (y llvmpipe) deja la ventana
-    # blanca; con el shader se ven los logos (aunque el hardware AMD siga
-    # fallando por el renderer RSX).
     -e 's/^antialiasing=.*/antialiasing=1/' \
     -e 's/^nitidez=.*/nitidez=1/' \
     -e 's/^filtrado_anisotropo=.*/filtrado_anisotropo=0/' "$ini"
