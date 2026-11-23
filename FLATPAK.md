@@ -160,17 +160,22 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
 - El `.rar`/`.zip` del ROM no se usa para este camino: el paquete de Patreon
   ya trae `juego/EBOOT.elf` y `juego/USRDIR`. Se acepta como argumento para
   que puedas pasarlo, pero no se extrae.
-- Los mensajes `MESA/radv` de Vulkan son ruido; el juego usa OpenGL y el
-  lanzador desactiva `winevulkan`.
-- El lanzador usa **OpenGL por software** por defecto (`LIBGL_ALWAYS_SOFTWARE=1`)
-  porque en algunas AMD/Mesa el GL por hardware del Flatpak falla. Es lento;
-  para probar hardware:
+- El juego usa **OpenGL**, no Vulkan. El lanzador desactiva `winevulkan` y,
+  por defecto, deja al loader de Vulkan sin ICDs (`VK_ICD_FILENAMES` y
+  `VK_DRIVER_FILES` a `/nonexistent`) para que `radv` no llene la terminal
+  con `vdrm_device_connect failed`. Para volver a habilitar Vulkan:
+  `--env=RACING_CLUB_VULKAN=1`. `MESA_DEBUG` queda en `silent`; para depurar:
+  `--env=MESA_DEBUG=`.
+- El lanzador usa **OpenGL por hardware** por defecto. En una VM con
+  `virtio-gpu`/virgl detecta el dispositivo y aplica
+  `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` y los overrides de versión 4.5
+  (virgl anuncia 4.3 y el juego pide 4.5 core). Para forzar software:
   ```sh
-  flatpak run --user --env=RACING_CLUB_SOFTWARE_GL=0 \
+  flatpak run --user --env=RACING_CLUB_SOFTWARE_GL=1 \
       io.github.nicobm.GtiClubRecomp
   ```
   No uses `flatpak override`: cambia la configuración para todas las
-  ejecuciones. El `--env` de una sola corrida es suficiente.
+  ejecuciones. Los `--env` de una sola corrida son suficientes.
 - El `glcache` del paquete es de la GPU del autor; el lanzador lo borra **una
   sola vez** y el juego regenera los shaders para tu GPU. Si se borrara en
   cada arranque, se perdería esa caché y todo iría lento. Para forzar el
@@ -182,10 +187,11 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   `DISPLAY=:0` junto con `WAYLAND_DISPLAY`; el lanzador quita `DISPLAY` si
   hay Wayland para que Wine no elija X11. Sin Wayland, `DISPLAY` queda como
   fallback.
-- En una VM con **Virtio GPU** sin aceleración 3D (virgl) no hay GL por
-  hardware real: el juego cae a software (llvmpipe), que funciona pero es
-  lento. Para hardware hace falta `virtio-gpu-gl`/virgl en el host, una GPU
-  real o passthrough. Zink tampoco sirve sin Vulkan/GPU funcional.
+- El modo virtio/virgl se activa solo si
+  `/sys/class/drm/card0/device/uevent` contiene `virtio`; si el sandbox no
+  puede leerlo, forzalo con `--env=RACING_CLUB_VIRTIO=1`. Si la VM no tiene
+  3D (sin virgl), usá `--env=RACING_CLUB_SOFTWARE_GL=1`: funciona con
+  llvmpipe, pero es lento.
 - El script ajusta `gtiport.ini` a 720p/60 con `antialiasing=1` y `nitidez=1`.
   Eso fuerza el *present* por shader; con ambos en 0 el juego usa
   `glBlitFramebuffer`, que en AMD/Mesa deja la ventana en blanco. El
@@ -196,9 +202,8 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   ```sh
   rm -f ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club/game/gtiport.ini
   ```
-- El render por hardware en algunas AMD/Mesa puede seguir mostrando blanco
-  aunque el *present* sea por shader: es el renderer RSX del juego, no el
-  Flatpak. En ese caso el modo software muestra los logos (lento) hasta que
-  se parchee `rsx_gl` y se recompile el juego.
+- Si el host no expone 3D al invitado (por ejemplo, virtio-gpu sin virgl),
+  el modo software muestra los logos pero es lento. El rendimiento por
+  hardware depende de que el host de la VM tenga virgl o passthrough.
 - El Flatpak contiene datos del juego de tu paquete de Patreon. Es para uso
   personal: no redistribuyas el paquete ni `prebuilt/`.
