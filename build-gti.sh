@@ -896,6 +896,9 @@ build_flatpak_repo() {
   [[ -f "$MANIFEST" ]] || die "No encuentro el manifiesto $MANIFEST."
   mkdir -p "$WORK_DIR"
 
+  # Caché de la versión anterior del script (ahora usamos .flatpak/state).
+  rm -rf "$REPO_DIR/.flatpak-builder"
+
   # Dentro de Toolbox solo se ve la instalación de usuario de Flatpak. El host
   # ya instaló aquí el SDK, el runtime y la base app de Wine.
   local ref
