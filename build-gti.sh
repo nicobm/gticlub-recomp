@@ -383,8 +383,12 @@ tune_prebuilt_ini() {
     -e 's/^resolucion_interna=.*/resolucion_interna=0/' \
     -e 's/^imagenes_por_segundo=.*/imagenes_por_segundo=60/' \
     -e 's/^pantalla_120hz=.*/pantalla_120hz=0/' \
-    -e 's/^antialiasing=.*/antialiasing=0/' \
-    -e 's/^nitidez=.*/nitidez=0/' \
+    # AA/sharpen en 1 fuerza el present por shader. Con ambos en 0 se usa
+    # glBlitFramebuffer directo, que en AMD/Mesa (y llvmpipe) deja la ventana
+    # blanca; con el shader se ven los logos (aunque el hardware AMD siga
+    # fallando por el renderer RSX).
+    -e 's/^antialiasing=.*/antialiasing=1/' \
+    -e 's/^nitidez=.*/nitidez=1/' \
     -e 's/^filtrado_anisotropo=.*/filtrado_anisotropo=0/' "$ini"
 }
 
