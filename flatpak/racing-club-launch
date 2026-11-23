@@ -29,7 +29,9 @@ fi
 export WINEPREFIX="$DATA_HOME/wineprefix"
 export WINEARCH=win64
 export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
-export WINEDLLOVERRIDES="mscoree=d;mshtml=d"
+# El juego usa OpenGL, no Vulkan. Desactivamos winevulkan para que Wine no
+# intente radv/Vulkan y llene la consola con errores inofensivos.
+export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-mscoree=d;mshtml=d;winevulkan=d}"
 
 if [ -x /app/bin/wine ]; then WINE=/app/bin/wine; else WINE=wine; fi
 if [ -x /app/bin/wineboot ]; then WINEBOOT=/app/bin/wineboot; else WINEBOOT=wineboot; fi
