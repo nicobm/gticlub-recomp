@@ -64,6 +64,19 @@ elif [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ] && [ ! -e "$GAME_DIR/.glcache-c
     rm -rf "$GAME_DIR/glcache"
     : > "$GAME_DIR/.glcache-cleaned"
 fi
+# El juego es un .exe de Windows: SDL crea el contexto con WGL, que Wine
+# traduce al driver X11 o al de Wayland. Con el driver Wayland el hardware
+# falla con "No matching GL pixel format available"; X11 sí encuentra el
+# pixel format. Si el Flatpak expone X11, preferimos X11.
+# RACING_CLUB_VIDEO=wayland fuerza el driver Wayland.
+if [ "${RACING_CLUB_VIDEO:-}" = "wayland" ]; then
+    unset DISPLAY
+    echo "Racing Club+: Wine sobre Wayland."
+elif [ -n "${DISPLAY:-}" ]; then
+    unset WAYLAND_DISPLAY
+    echo "Racing Club+: Wine sobre X11 (DISPLAY=$DISPLAY)."
+fi
+
 # El juego usa OpenGL. winevulkan=d evita que Wine intente radv/Vulkan.
 export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d}"
 

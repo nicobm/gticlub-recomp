@@ -176,6 +176,11 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   cada arranque, se perdería esa caché y todo iría lento. Para forzar el
   borrado: `--env=RACING_CLUB_RESET_GLCACHE=1`. Para conservar incluso el del
   autor: `--env=RACING_CLUB_KEEP_GLCACHE=1`.
+- El juego es un `.exe` de Windows: SDL crea el contexto con **WGL**, que Wine
+  traduce al driver X11 o al de Wayland. Con el driver Wayland el hardware
+  puede fallar con `No matching GL pixel format available`; el lanzador
+  prefiere **X11** si el Flatpak lo expone. Para forzar Wayland:
+  `--env=RACING_CLUB_VIDEO=wayland`.
 - Si el GL por hardware (radeonsi) deja la ventana en blanco o negra, probá
   **zink** (OpenGL sobre Vulkan), que usa otra ruta del driver:
   ```sh

@@ -11,6 +11,7 @@
         "--share=ipc",
         "--socket=wayland",
         "--socket=fallback-x11",
+        "--socket=x11",
         "--socket=pulseaudio",
         "--allow=devel",
         "--device=dri",
