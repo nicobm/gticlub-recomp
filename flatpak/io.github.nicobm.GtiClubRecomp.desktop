@@ -7,6 +7,6 @@ Comment=Port nativo de GTI Club+ Rally Côte d'Azur
 Exec=racing-club-launch
 Icon=io.github.nicobm.GtiClubRecomp
 Terminal=false
-Categories=Game;RacingGame;
+Categories=Game;
 Keywords=gti;club;racing;rally;coches;
 StartupNotify=false
