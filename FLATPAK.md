@@ -113,10 +113,16 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club
 ## Permisos del sandbox
 
 - `--share=network`: online.
-- `--nofilesystem=home` y `--nofilesystem=host`: sin acceso a tu carpeta
-  personal ni al resto del sistema.
+- `--filesystem=home`: el Flatpak puede ver tu carpeta personal
+  (`~/Documentos`, `~/Descargas`, etc.). Es para que un file browser o el
+  instalador puedan elegir archivos; el juego prebuilt no lo necesita.
+- `--nofilesystem=host`: sin acceso al resto del sistema (`/`, `/usr`, otros
+  usuarios, etc.).
 - `--socket=wayland`, `--socket=fallback-x11`, `--socket=pulseaudio`,
   `--device=dri`, `--device=input`: pantalla, sonido, GPU y mandos.
+
+Si no querés exponer todo el home, se puede cambiar `--filesystem=home` por
+`--filesystem=xdg-documents` y `--filesystem=xdg-download`.
 
 ## Si venís de la versión anterior
 

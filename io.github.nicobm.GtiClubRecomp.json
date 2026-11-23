@@ -15,7 +15,7 @@
         "--allow=devel",
         "--device=dri",
         "--device=input",
-        "--nofilesystem=home",
+        "--filesystem=home",
         "--nofilesystem=host"
     ],
     "modules": [
