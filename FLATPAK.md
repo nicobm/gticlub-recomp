@@ -51,9 +51,9 @@ El script:
 5. Extrae `NPEB00060/USRDIR/data` de tu archivo del juego. No copia el
    `EBOOT.BIN` ni el `shadercache`: solo los datos que usa el port.
 6. Construye el Flatpak con `flatpak-builder --user` y lo instala desde el
-   **host**. Si hay `flathub` del sistema, el juego queda instalado para todo
-   el sistema (desde un bundle temporal); si no, en tu usuario con un remoto
-   local (igual que senjin-recomped).
+   **host** en tu **usuario**, con el remoto local `gticlub-local` (igual que
+   el `senjin-local` de senjin-recomped). Así no pide sudo para instalar el
+   juego. Se puede forzar instalación de sistema con `GTI_APP_SCOPE=system`.
 
 Al terminar:
 
@@ -97,25 +97,22 @@ GTI_DATA='/ruta/a/NPEB00060' bash build-gti.sh
 # Elegir un contenedor Toolbox concreto:
 GTI_TOOLBOX=fedora-toolbox-43 bash build-gti.sh
 
-# Forzar instalación de usuario o de sistema:
-GTI_FLATPAK_SCOPE=user bash build-gti.sh
+# Runtimes/base app: sistema (auto) o usuario:
 GTI_FLATPAK_SCOPE=system bash build-gti.sh
+GTI_FLATPAK_SCOPE=user bash build-gti.sh
+
+# El juego: usuario por defecto (sin sudo):
+GTI_APP_SCOPE=user bash build-gti.sh
+GTI_APP_SCOPE=system bash build-gti.sh
 ```
 
-`GTI_FLATPAK_SCOPE=auto` (lo normal) usa el `flathub` del sistema si existe;
-si no, el de usuario.
+`GTI_FLATPAK_SCOPE=auto` (lo normal) usa el `flathub` del sistema si existe
+para los runtimes; si no, el de usuario. `GTI_APP_SCOPE=user` (lo normal) es
+el que instala el juego sin pedir sudo.
 
 ## Desinstalar
 
-Si se instaló en el sistema:
-
-```sh
-flatpak uninstall --system io.github.nicobm.GtiClubRecomp
-flatpak remote-delete --system --force gticlub-local
-rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
-```
-
-Si se instaló en el usuario:
+Por defecto el juego se instala en el usuario:
 
 ```sh
 flatpak uninstall --user io.github.nicobm.GtiClubRecomp
@@ -123,11 +120,33 @@ flatpak remote-delete --user --force gticlub-local
 rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
 ```
 
-El juego se instala con el `flathub` del sistema. Para compilar en Toolbox se
-usan runtimes de **usuario**; si no existía un `flathub` de usuario, el script
-añade `gticlub-build-flathub` solo para eso y lo deja desactivado. No crea un
-`flathub` de usuario. Si una versión anterior del script te dejó uno, puedes
-quitarlo cuando ya no necesites sus runtimes de compilación:
+Si lo instalaste en el sistema (`GTI_APP_SCOPE=system`):
+
+```sh
+flatpak uninstall --system io.github.nicobm.GtiClubRecomp
+flatpak remote-delete --system --force gticlub-local
+rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
+```
+
+### Venís de una instalación de sistema anterior
+
+Las versiones anteriores del script instalaban el juego en el sistema. Para
+que `flatpak run` use la instalación de usuario y no pida sudo, quitá la del
+sistema una vez:
+
+```sh
+flatpak uninstall --system io.github.nicobm.GtiClubRecomp
+flatpak remote-delete --system --force gticlub-local
+```
+
+Los runtimes de sistema (`org.freedesktop.Platform`, `org.winehq.Wine`) se
+pueden quedar; no molestan.
+
+Para compilar en Toolbox se usan runtimes de **usuario**; si no existía un
+`flathub` de usuario, el script añade `gticlub-build-flathub` solo para eso y
+lo deja desactivado. No crea un `flathub` de usuario. Si una versión anterior
+del script te dejó uno, puedes quitarlo cuando ya no necesites sus runtimes de
+compilación:
 
 ```sh
 flatpak uninstall --user --unused

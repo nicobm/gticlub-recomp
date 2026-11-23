@@ -15,8 +15,10 @@
 #   GTI_DATA=/ruta/NPEB00060     datos ya extraídos (evita extraer el .rar)
 #   GTI_TOOLBOX=fedora-toolbox-43  contenedor de Toolbox a usar
 #   GTI_FLATPAK_SCOPE=auto|system|user
-#                                instalar runtimes/Flatpak en el sistema o en
-#                                el usuario (auto: sistema si existe flathub)
+#                                dónde instalar los runtimes/base app
+#                                (auto: sistema si existe flathub)
+#   GTI_APP_SCOPE=user|system     dónde instalar el juego (por defecto user,
+#                                así no pide sudo)
 #
 # El build se ejecuta dentro de Toolbox; la instalación del Flatpak se hace
 # desde el host, donde sí se ve el flathub del sistema de Silverblue/Bazzite.
@@ -26,7 +28,10 @@ set -Eeuo pipefail
 
 APP_ID="io.github.nicobm.GtiClubRecomp"
 LOCAL_REMOTE="gticlub-local"
+# FLATPAK_SCOPE: dónde se instalan los runtimes/base app (auto = sistema si hay flathub).
 FLATPAK_SCOPE="${GTI_FLATPAK_SCOPE:-auto}"
+# APP_SCOPE: dónde se instala el juego. Por defecto usuario: no pide sudo.
+APP_SCOPE="${GTI_APP_SCOPE:-user}"
 
 SCRIPT_PATH="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/$(basename -- "${BASH_SOURCE[0]}")"
 SCRIPT_DIR="$(dirname -- "$SCRIPT_PATH")"
@@ -690,9 +695,9 @@ resolve_host_flatpak_scope() {
     *) die "GTI_FLATPAK_SCOPE debe ser auto, system o user." ;;
   esac
   if [[ "$FLATPAK_SCOPE" == "system" ]]; then
-    say "Flatpak: el juego se instalará en el sistema (flathub del sistema)"
+    say "Flatpak: runtimes/base app desde el flathub del sistema"
   else
-    say "Flatpak: el juego se instalará en el usuario (flathub del usuario)"
+    say "Flatpak: runtimes/base app desde el flathub del usuario"
   fi
   FLATPAK_SCOPE_DONE=1
 }
@@ -771,7 +776,7 @@ install_host_flatpak_dependencies() {
 
   printf 'Faltan estos runtimes de Flathub:\n'
   if ((${#system_missing[@]} > 0)); then
-    printf '  [sistema, para jugar] %s\n' "${system_missing[@]}"
+    printf '  [sistema] %s\n' "${system_missing[@]}"
   fi
   if ((${#user_missing[@]} > 0)); then
     printf '  [usuario, para el build en Toolbox] %s\n' "${user_missing[@]}"
@@ -800,18 +805,29 @@ Puedes forzar la instalación de usuario con:
 
 install_host_flatpak_app() {
   resolve_host_flatpak_scope
+  case "$APP_SCOPE" in
+    user|system) ;;
+    *) die "GTI_APP_SCOPE debe ser user o system." ;;
+  esac
   [[ -d "$WORK_DIR/repo" ]] ||
     die "No encuentro el repositorio Flatpak construido en $WORK_DIR/repo."
 
   local scope_flag="--system"
-  [[ "$FLATPAK_SCOPE" == "user" ]] && scope_flag="--user"
+  [[ "$APP_SCOPE" == "user" ]] && scope_flag="--user"
+
+  if [[ "$APP_SCOPE" == "user" ]] && flatpak info --system "$APP_ID" >/dev/null 2>&1; then
+    say "Aviso: hay una instalación del sistema anterior de $APP_ID."
+    printf 'Para que "flatpak run" use la de usuario, quitá la del sistema:\n'
+    printf '  flatpak uninstall --system %s\n' "$APP_ID"
+    printf '  flatpak remote-delete --system --force %s\n' "$LOCAL_REMOTE"
+  fi
 
   local repo_uri
   repo_uri="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$WORK_DIR/repo")"
 
   # El juego va en un remoto local separado de flathub; los runtimes y la base
   # app vienen del flathub del sistema.
-  say "Instalando el juego en la instalación $FLATPAK_SCOPE desde el remoto local $LOCAL_REMOTE"
+  say "Instalando el juego en la instalación $APP_SCOPE desde el remoto local $LOCAL_REMOTE"
   if flatpak remotes "$scope_flag" --show-disabled --columns=name 2>/dev/null | grep -qx "$LOCAL_REMOTE"; then
     flatpak remote-modify "$scope_flag" --no-gpg-verify --no-use-for-deps --enumerate \
       --enable --url="$repo_uri" "$LOCAL_REMOTE" ||
@@ -837,7 +853,7 @@ install_host_flatpak_app() {
   # Si el daemon del sistema no puede leer el repo dentro de $HOME, se cae al
   # bundle temporal de /var/tmp. El caso normal es el remoto local.
   if ! flatpak install "$scope_flag" --reinstall --noninteractive "$LOCAL_REMOTE" "${refs[@]}"; then
-    if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+    if [[ "$APP_SCOPE" == "system" ]]; then
       say "El remoto local del sistema falló; probando un bundle temporal en /var/tmp"
       local bundle="/var/tmp/gticlub-$APP_ID.flatpak"
       rm -f "$bundle"
@@ -846,7 +862,7 @@ install_host_flatpak_app() {
       flatpak install --system --reinstall --noninteractive "$bundle" ||
         die "No se pudo instalar el Flatpak en el sistema.
 Puedes forzar la instalación de usuario con:
-  GTI_FLATPAK_SCOPE=user bash build-gti.sh"
+  GTI_APP_SCOPE=user bash build-gti.sh"
       rm -f "$bundle"
     else
       die "No se pudo instalar el Flatpak desde el repositorio local."
@@ -862,7 +878,7 @@ Puedes forzar la instalación de usuario con:
 }
 
 print_summary() {
-  if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+  if [[ "$APP_SCOPE" == "system" ]]; then
     cat <<EOF
 Racing Club+ está instalado como Flatpak del sistema:
 
