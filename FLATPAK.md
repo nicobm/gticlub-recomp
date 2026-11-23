@@ -177,19 +177,12 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   borrado: `--env=RACING_CLUB_RESET_GLCACHE=1`. Para conservar incluso el del
   autor: `--env=RACING_CLUB_KEEP_GLCACHE=1`.
 - El juego es un `.exe` de Windows: SDL crea el contexto con **WGL**, que Wine
-  traduce al driver X11 o al de Wayland. Con el driver Wayland el hardware
-  puede fallar con `No matching GL pixel format available`; el lanzador
-  prefiere **X11** si el Flatpak lo expone. Para forzar Wayland:
-  `--env=RACING_CLUB_VIDEO=wayland`.
-- Si el GL por hardware (radeonsi) deja la ventana en blanco o negra, probá
-  **zink** (OpenGL sobre Vulkan), que usa otra ruta del driver:
-  ```sh
-  flatpak run --user \
-      --env=RACING_CLUB_SOFTWARE_GL=0 \
-      --env=MESA_LOADER_DRIVER_OVERRIDE=zink \
-      --env=GALLIUM_DRIVER=zink \
-      io.github.nicobm.GtiClubRecomp
-  ```
+  traduce al driver **Wayland** (preferido) o X11 (fallback). El manifiesto
+  usa `--socket=wayland` y `--socket=fallback-x11`; no se fuerza X11.
+- En una VM con **Virtio GPU** sin aceleración 3D (virgl) no hay GL por
+  hardware real: el juego cae a software (llvmpipe), que funciona pero es
+  lento. Para hardware hace falta `virtio-gpu-gl`/virgl en el host, una GPU
+  real o passthrough. Zink tampoco sirve sin Vulkan/GPU funcional.
 - El script ajusta `gtiport.ini` a 720p/60 con `antialiasing=1` y `nitidez=1`.
   Eso fuerza el *present* por shader; con ambos en 0 el juego usa
   `glBlitFramebuffer`, que en AMD/Mesa deja la ventana en blanco. El
