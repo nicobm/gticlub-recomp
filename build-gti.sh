@@ -209,6 +209,8 @@ host_stage() {
 
   command -v toolbox >/dev/null 2>&1 ||
     die "No encuentro 'toolbox'. Este script está pensado para Fedora Silverblue/Bazzite con Toolbox."
+  command -v flatpak >/dev/null 2>&1 ||
+    die "No encuentro 'flatpak' en el host. Sin Flatpak no se puede instalar el paquete final."
 
   local container="${GTI_TOOLBOX:-}"
   if [[ -z "$container" ]]; then
