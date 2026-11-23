@@ -803,37 +803,23 @@ install_host_flatpak_app() {
   [[ -d "$WORK_DIR/repo" ]] ||
     die "No encuentro el repositorio Flatpak construido en $WORK_DIR/repo."
 
-  if [[ "$FLATPAK_SCOPE" == "system" ]]; then
-    # Una instalación del sistema no necesita un remoto local permanente (y el
-    # daemon de Flatpak puede tener problemas para leer un repo dentro de
-    # $HOME). Exportamos un bundle y lo instalamos desde /var/tmp.
-    local bundle="/var/tmp/gticlub-$APP_ID.flatpak"
-    rm -f "$bundle"
-    flatpak build-bundle --arch=x86_64 "$WORK_DIR/repo" "$bundle" "$APP_ID" master ||
-      die "No se pudo crear el bundle del Flatpak."
-    flatpak install --system --reinstall --noninteractive "$bundle" ||
-      die "No se pudo instalar el Flatpak en el sistema.
-Puedes forzar la instalación de usuario con:
-  GTI_FLATPAK_SCOPE=user bash build-gti.sh"
-    rm -f "$bundle"
+  local scope_flag="--system"
+  [[ "$FLATPAK_SCOPE" == "user" ]] && scope_flag="--user"
 
-    flatpak list --system --app --columns=application 2>/dev/null | grep -qx "$APP_ID" ||
-      die "El Flatpak se construyó pero no aparece instalado en el sistema."
-    return 0
-  fi
-
-  # Instalación de usuario: remoto local, como senjin-recomped.
   local repo_uri
   repo_uri="$(python3 -c 'import pathlib,sys; print(pathlib.Path(sys.argv[1]).resolve().as_uri())' "$WORK_DIR/repo")"
 
-  if flatpak remotes --user --show-disabled --columns=name 2>/dev/null | grep -qx "$LOCAL_REMOTE"; then
-    flatpak remote-modify --user --no-gpg-verify --no-use-for-deps --enumerate \
+  # El juego va en un remoto local separado de flathub; los runtimes y la base
+  # app vienen del flathub del sistema.
+  say "Instalando el juego en la instalación $FLATPAK_SCOPE desde el remoto local $LOCAL_REMOTE"
+  if flatpak remotes "$scope_flag" --show-disabled --columns=name 2>/dev/null | grep -qx "$LOCAL_REMOTE"; then
+    flatpak remote-modify "$scope_flag" --no-gpg-verify --no-use-for-deps --enumerate \
       --enable --url="$repo_uri" "$LOCAL_REMOTE" ||
-      die "No se pudo modificar el remoto local de usuario."
+      die "No se pudo modificar el remoto local de Flatpak."
   else
-    flatpak remote-add --user --no-gpg-verify --no-use-for-deps \
+    flatpak remote-add "$scope_flag" --no-gpg-verify --no-use-for-deps \
       "$LOCAL_REMOTE" "$repo_uri" ||
-      die "No se pudo añadir el remoto local de usuario."
+      die "No se pudo añadir el remoto local de Flatpak."
   fi
 
   local -a refs=()
@@ -842,19 +828,36 @@ Puedes forzar la instalación de usuario con:
     case "$ref" in
       app/"$APP_ID"/*|"$APP_ID"/*) refs+=("$ref") ;;
     esac
-  done < <(flatpak remote-ls --user --all --columns=ref "$LOCAL_REMOTE" 2>/dev/null || true)
+  done < <(flatpak remote-ls "$scope_flag" --all --columns=ref "$LOCAL_REMOTE" 2>/dev/null || true)
 
   if ((${#refs[@]} == 0)); then
     refs=("app/$APP_ID/x86_64/master")
   fi
 
-  flatpak install --user --reinstall --noninteractive "$LOCAL_REMOTE" "${refs[@]}" ||
-    die "No se pudo instalar el Flatpak desde el repositorio local."
+  # Si el daemon del sistema no puede leer el repo dentro de $HOME, se cae al
+  # bundle temporal de /var/tmp. El caso normal es el remoto local.
+  if ! flatpak install "$scope_flag" --reinstall --noninteractive "$LOCAL_REMOTE" "${refs[@]}"; then
+    if [[ "$FLATPAK_SCOPE" == "system" ]]; then
+      say "El remoto local del sistema falló; probando un bundle temporal en /var/tmp"
+      local bundle="/var/tmp/gticlub-$APP_ID.flatpak"
+      rm -f "$bundle"
+      flatpak build-bundle --arch=x86_64 "$WORK_DIR/repo" "$bundle" "$APP_ID" master ||
+        die "No se pudo crear el bundle del Flatpak."
+      flatpak install --system --reinstall --noninteractive "$bundle" ||
+        die "No se pudo instalar el Flatpak en el sistema.
+Puedes forzar la instalación de usuario con:
+  GTI_FLATPAK_SCOPE=user bash build-gti.sh"
+      rm -f "$bundle"
+    else
+      die "No se pudo instalar el Flatpak desde el repositorio local."
+    fi
+  fi
 
-  flatpak remote-modify --user --disable "$LOCAL_REMOTE" ||
+  # Es una compilación local: flatpak update no tiene nada que buscar.
+  flatpak remote-modify "$scope_flag" --disable "$LOCAL_REMOTE" ||
     printf 'Aviso: no se pudo desactivar el remoto %s.\n' "$LOCAL_REMOTE" >&2
 
-  flatpak list --user --app --columns=application 2>/dev/null | grep -qx "$APP_ID" ||
+  flatpak list "$scope_flag" --app --columns=application 2>/dev/null | grep -qx "$APP_ID" ||
     die "El Flatpak se construyó pero no aparece instalado."
 }
 
@@ -871,6 +874,7 @@ Los datos y las partidas de tu usuario se guardan en:
 
 Para desinstalarlo:
   flatpak uninstall --system $APP_ID
+  flatpak remote-delete --system --force $LOCAL_REMOTE
 EOF
   else
     cat <<EOF

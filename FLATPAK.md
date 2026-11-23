@@ -111,6 +111,7 @@ Si se instaló en el sistema:
 
 ```sh
 flatpak uninstall --system io.github.nicobm.GtiClubRecomp
+flatpak remote-delete --system --force gticlub-local
 rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
 ```
 
