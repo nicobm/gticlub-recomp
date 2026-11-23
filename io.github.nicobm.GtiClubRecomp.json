@@ -23,8 +23,8 @@
             "name": "racing-club",
             "buildsystem": "simple",
             "build-commands": [
-                "install -Dm755 gtiport.exe /app/share/racing-club/game/gtiport.exe",
-                "cp -a game-data/. /app/share/racing-club/game/",
+                "mkdir -p /app/share/racing-club/game",
+                "cp -a game/. /app/share/racing-club/game/",
                 "install -Dm755 racing-club-launch /app/bin/racing-club-launch",
                 "install -Dm644 io.github.nicobm.GtiClubRecomp.desktop /app/share/applications/io.github.nicobm.GtiClubRecomp.desktop",
                 "install -Dm644 io.github.nicobm.GtiClubRecomp.svg /app/share/icons/hicolor/scalable/apps/io.github.nicobm.GtiClubRecomp.svg",
@@ -32,13 +32,9 @@
             ],
             "sources": [
                 {
-                    "type": "file",
-                    "path": "build-gti/gtiport.exe"
-                },
-                {
                     "type": "dir",
-                    "path": "game-data",
-                    "dest": "game-data"
+                    "path": "prebuilt",
+                    "dest": "game"
                 },
                 {
                     "type": "file",

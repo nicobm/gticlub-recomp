@@ -17,6 +17,7 @@ src/recomp/spu_gen/
 # --- build-gti.sh: artefactos locales ---
 build-gti/
 game-data/
+prebuilt/
 .flatpak/
 .flatpak-builder/
 .flatpak-build/
