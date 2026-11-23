@@ -42,8 +42,14 @@ export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
 
 # El GL por hardware de este Flatpak falla en algunas AMD/Mesa; llvmpipe
 # abre el juego. Se puede forzar hardware con RACING_CLUB_SOFTWARE_GL=0.
+# Exportamos siempre el valor (también el 0): si el entorno o un override
+# dejó LIBGL_ALWAYS_SOFTWARE=1, el pedido de hardware no se aplicaría.
 if [ "${RACING_CLUB_SOFTWARE_GL:-1}" = "1" ]; then
     export LIBGL_ALWAYS_SOFTWARE=1
+    echo "Racing Club+: OpenGL por software (llvmpipe)."
+else
+    export LIBGL_ALWAYS_SOFTWARE=0
+    echo "Racing Club+: OpenGL por hardware."
 fi
 
 # El glcache del paquete es de la GPU del autor; en otra GPU conviene
