@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.nicobm.GtiClubRecomp</id>
+  <name>Racing Club+</name>
+  <summary>Port nativo de GTI Club+ Rally Côte d'Azur</summary>
+  <developer id="io.github.nicobm">
+    <name>nicobm</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>LicenseRef-proprietary</project_license>
+  <description>
+    <p>
+      Reimplementación nativa para PC de GTI Club+ Rally Côte d'Azur.
+      No incluye archivos del juego: usa los datos de tu propia copia.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.nicobm.GtiClubRecomp.desktop</launchable>
+  <url type="homepage">https://github.com/nicobm/gticlub-recomp</url>
+  <url type="bugtracker">https://github.com/nicobm/gticlub-recomp/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="1.0" date="2026-11-23"/>
+  </releases>
+</component>

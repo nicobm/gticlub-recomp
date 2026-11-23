@@ -1,0 +1,43 @@
+#!/bin/sh
+# Lanzador de Racing Club+ dentro del Flatpak.
+#
+# /app es de solo lectura, pero el juego escribe ajustes y partidas en su
+# carpeta. La primera vez copiamos los datos a la carpeta de datos de la app
+# (~/.var/app/.../data) y ejecutamos el .exe con el Wine del runtime base.
+set -eu
+
+APP_ID="io.github.nicobm.GtiClubRecomp"
+SRC_DIR="/app/share/racing-club/game"
+
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.var/app/$APP_ID/data}"
+GAME_DIR="$DATA_HOME/racing-club/game"
+
+mkdir -p "$GAME_DIR"
+
+# -n: nunca sobrescribe ajustes ni partidas existentes.
+if [ ! -f "$GAME_DIR/gtiport.exe" ]; then
+    echo "Racing Club+: copiando los datos del juego a $GAME_DIR (primera vez)..."
+fi
+cp -rn "$SRC_DIR/." "$GAME_DIR/" 2>/dev/null || true
+chmod -R u+w "$GAME_DIR" 2>/dev/null || true
+
+if [ ! -f "$GAME_DIR/gtiport.exe" ]; then
+    echo "Racing Club+: no se pudieron copiar los datos del juego." >&2
+    exit 1
+fi
+
+export WINEPREFIX="$DATA_HOME/wineprefix"
+export WINEARCH=win64
+export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
+export WINEDLLOVERRIDES="mscoree=d;mshtml=d"
+
+if [ -x /app/bin/wine ]; then WINE=/app/bin/wine; else WINE=wine; fi
+if [ -x /app/bin/wineboot ]; then WINEBOOT=/app/bin/wineboot; else WINEBOOT=wineboot; fi
+
+if [ ! -d "$WINEPREFIX/drive_c" ]; then
+    echo "Racing Club+: preparando el prefijo de Wine (primera vez)..."
+    "$WINEBOOT" -u >/dev/null 2>&1 || true
+fi
+
+cd "$GAME_DIR"
+exec "$WINE" "$GAME_DIR/gtiport.exe" "$@"

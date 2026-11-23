@@ -1,0 +1,61 @@
+{
+    "app-id": "io.github.nicobm.GtiClubRecomp",
+    "runtime": "org.freedesktop.Platform",
+    "runtime-version": "26.08",
+    "sdk": "org.freedesktop.Sdk",
+    "base": "org.winehq.Wine",
+    "base-version": "stable-26.08",
+    "command": "racing-club-launch",
+    "finish-args": [
+        "--share=network",
+        "--share=ipc",
+        "--socket=wayland",
+        "--socket=fallback-x11",
+        "--socket=pulseaudio",
+        "--allow=devel",
+        "--device=dri",
+        "--device=input",
+        "--nofilesystem=home",
+        "--nofilesystem=host"
+    ],
+    "modules": [
+        {
+            "name": "racing-club",
+            "buildsystem": "simple",
+            "build-commands": [
+                "install -Dm755 gtiport.exe /app/share/racing-club/game/gtiport.exe",
+                "cp -a game-data/. /app/share/racing-club/game/",
+                "install -Dm755 racing-club-launch /app/bin/racing-club-launch",
+                "install -Dm644 io.github.nicobm.GtiClubRecomp.desktop /app/share/applications/io.github.nicobm.GtiClubRecomp.desktop",
+                "install -Dm644 io.github.nicobm.GtiClubRecomp.svg /app/share/icons/hicolor/scalable/apps/io.github.nicobm.GtiClubRecomp.svg",
+                "install -Dm644 io.github.nicobm.GtiClubRecomp.metainfo.xml /app/share/metainfo/io.github.nicobm.GtiClubRecomp.metainfo.xml"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "path": "build-gti/gtiport.exe"
+                },
+                {
+                    "type": "dir",
+                    "path": "game-data"
+                },
+                {
+                    "type": "file",
+                    "path": "flatpak/racing-club-launch"
+                },
+                {
+                    "type": "file",
+                    "path": "flatpak/io.github.nicobm.GtiClubRecomp.desktop"
+                },
+                {
+                    "type": "file",
+                    "path": "flatpak/io.github.nicobm.GtiClubRecomp.svg"
+                },
+                {
+                    "type": "file",
+                    "path": "flatpak/io.github.nicobm.GtiClubRecomp.metainfo.xml"
+                }
+            ]
+        }
+    ]
+}

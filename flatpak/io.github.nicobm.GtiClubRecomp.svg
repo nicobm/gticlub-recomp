@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <rect width="256" height="256" rx="48" fill="#111318"/>
+  <g transform="translate(24 24)">
+    <g fill="#f2f2f2">
+      <rect x="0" y="0" width="26" height="26"/>
+      <rect x="52" y="0" width="26" height="26"/>
+      <rect x="104" y="0" width="26" height="26"/>
+      <rect x="156" y="0" width="26" height="26"/>
+      <rect x="26" y="26" width="26" height="26"/>
+      <rect x="78" y="26" width="26" height="26"/>
+      <rect x="130" y="26" width="26" height="26"/>
+      <rect x="0" y="52" width="26" height="26"/>
+      <rect x="52" y="52" width="26" height="26"/>
+      <rect x="104" y="52" width="26" height="26"/>
+      <rect x="156" y="52" width="26" height="26"/>
+    </g>
+    <path d="M18 118 C58 88 104 84 144 104 L182 126 C190 130 194 138 192 146 L188 162 L20 162 L14 142 C12 132 13 124 18 118 Z"
+          fill="#d22b2b"/>
+    <path d="M40 126 L74 106 L112 106 L128 126 Z" fill="#1b2430"/>
+    <path d="M132 126 L150 110 L174 126 Z" fill="#1b2430"/>
+    <circle cx="58" cy="166" r="22" fill="#0b0d10" stroke="#f2f2f2" stroke-width="8"/>
+    <circle cx="158" cy="166" r="22" fill="#0b0d10" stroke="#f2f2f2" stroke-width="8"/>
+  </g>
+</svg>
