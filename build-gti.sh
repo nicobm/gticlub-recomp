@@ -372,6 +372,19 @@ prepare_prebuilt() {
   verify_prebuilt
 }
 
+tune_prebuilt_ini() {
+  local ini="$PREBUILT_DIR/gtiport.ini"
+  [[ -f "$ini" ]] || return 0
+  # El ini del autor viene en 4K/fullscreen/72 Hz; en otra GPU eso puede
+  # quedar en negro o comer CPU. Arrancamos en ventana 720p/60 y se cambia
+  # desde el menú F1 del juego.
+  sed -i \
+    -e 's/^pantalla_completa=.*/pantalla_completa=0/' \
+    -e 's/^resolucion_interna=.*/resolucion_interna=0/' \
+    -e 's/^imagenes_por_segundo=.*/imagenes_por_segundo=60/' \
+    -e 's/^pantalla_120hz=.*/pantalla_120hz=0/' "$ini"
+}
+
 verify_prebuilt() {
   [[ -f "$PREBUILT_DIR/Racing Club+.exe" ]] ||
     die "Falta $PREBUILT_DIR/Racing Club+.exe."
@@ -393,6 +406,8 @@ verify_prebuilt() {
   printf '  Racing Club+.exe: %d MB\n' "$((exe_size / 1024 / 1024))"
   printf '  EBOOT.elf: SHA1 correcto\n'
   printf '  Datos y shadercache: presentes\n'
+
+  tune_prebuilt_ini
 }
 
 # ---------------------------------------------------------------- Flatpak host

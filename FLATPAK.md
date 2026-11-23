@@ -104,6 +104,15 @@ y prepara el prefijo de Wine en:
 ~/.var/app/io.github.nicobm.GtiClubRecomp/data/wineprefix
 ```
 
+El `gtiport.ini` del paquete viene en 4K/fullscreen/72 Hz. El script lo ajusta
+a **ventana 720p/60** para el primer arranque; después se cambia desde el menú
+**F1** del juego. Si ya tenías un `gtiport.ini` en el directorio de datos y no
+quieres esperar, borralo para que se copie el nuevo:
+
+```sh
+rm -f ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club/game/gtiport.ini
+```
+
 Las partidas y ajustes se quedan en `racing-club/game`. Para borrarlos:
 
 ```sh
