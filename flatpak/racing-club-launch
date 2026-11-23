@@ -25,6 +25,17 @@ if [ ! -f "$GAME_DIR/Racing Club+.exe" ]; then
     exit 1
 fi
 
+# Con antialiasing=0 y nitidez=0 el juego usa glBlitFramebuffer directo, que
+# en AMD/Mesa (y llvmpipe) deja la ventana en blanco. Si el ini viejo del
+# usuario tiene ambos en 0, activamos AA para forzar el present por shader.
+INI="$GAME_DIR/gtiport.ini"
+if [ -f "$INI" ] &&
+    grep -q '^antialiasing=0' "$INI" &&
+    grep -q '^nitidez=0' "$INI"; then
+    echo "Racing Club+: activando present por shader (evita ventana blanca)..."
+    sed -i 's/^antialiasing=[^[:space:]]*/antialiasing=1/' "$INI"
+fi
+
 export WINEPREFIX="$DATA_HOME/wineprefix"
 export WINEARCH=win64
 export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
