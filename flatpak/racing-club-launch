@@ -42,20 +42,27 @@ export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
 
 # El GL por hardware de este Flatpak falla en algunas AMD/Mesa; llvmpipe
 # abre el juego. Se puede forzar hardware con RACING_CLUB_SOFTWARE_GL=0.
-# Exportamos siempre el valor (también el 0): si el entorno o un override
-# dejó LIBGL_ALWAYS_SOFTWARE=1, el pedido de hardware no se aplicaría.
+# En hardware desactivamos la variable (no la ponemos en 0): así también se
+# ignora un LIBGL_ALWAYS_SOFTWARE=1 heredado de un override viejo.
 if [ "${RACING_CLUB_SOFTWARE_GL:-1}" = "1" ]; then
     export LIBGL_ALWAYS_SOFTWARE=1
     echo "Racing Club+: OpenGL por software (llvmpipe)."
 else
-    export LIBGL_ALWAYS_SOFTWARE=0
+    unset LIBGL_ALWAYS_SOFTWARE
     echo "Racing Club+: OpenGL por hardware."
 fi
 
-# El glcache del paquete es de la GPU del autor; en otra GPU conviene
-# borrarlo y dejar que el juego regenere los shaders.
-if [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ]; then
+# El glcache del paquete es de la GPU del autor; en otra GPU los binarios se
+# rechazan y el juego recompila. Se borra UNA sola vez: si se borra en cada
+# arranque, se pierde la caché ya regenerada para esta GPU y todo va lento
+# (o parece colgado mientras recompila). RACING_CLUB_RESET_GLCACHE=1 fuerza
+# el borrado; RACING_CLUB_KEEP_GLCACHE=1 conserva incluso el del autor.
+if [ "${RACING_CLUB_RESET_GLCACHE:-0}" = "1" ]; then
     rm -rf "$GAME_DIR/glcache"
+    : > "$GAME_DIR/.glcache-cleaned"
+elif [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ] && [ ! -e "$GAME_DIR/.glcache-cleaned" ]; then
+    rm -rf "$GAME_DIR/glcache"
+    : > "$GAME_DIR/.glcache-cleaned"
 fi
 # El juego usa OpenGL. winevulkan=d evita que Wine intente radv/Vulkan.
 export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d}"

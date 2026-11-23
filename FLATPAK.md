@@ -171,9 +171,20 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   ```
   No uses `flatpak override`: cambia la configuración para todas las
   ejecuciones. El `--env` de una sola corrida es suficiente.
-- El `glcache` del paquete es de la GPU del autor; el lanzador lo borra y el
-  juego regenera los shaders. Si querés conservarlo:
-  `--env=RACING_CLUB_KEEP_GLCACHE=1`.
+- El `glcache` del paquete es de la GPU del autor; el lanzador lo borra **una
+  sola vez** y el juego regenera los shaders para tu GPU. Si se borrara en
+  cada arranque, se perdería esa caché y todo iría lento. Para forzar el
+  borrado: `--env=RACING_CLUB_RESET_GLCACHE=1`. Para conservar incluso el del
+  autor: `--env=RACING_CLUB_KEEP_GLCACHE=1`.
+- Si el GL por hardware (radeonsi) deja la ventana en blanco o negra, probá
+  **zink** (OpenGL sobre Vulkan), que usa otra ruta del driver:
+  ```sh
+  flatpak run --user \
+      --env=RACING_CLUB_SOFTWARE_GL=0 \
+      --env=MESA_LOADER_DRIVER_OVERRIDE=zink \
+      --env=GALLIUM_DRIVER=zink \
+      io.github.nicobm.GtiClubRecomp
+  ```
 - El script ajusta `gtiport.ini` a 720p/60 con `antialiasing=1` y `nitidez=1`.
   Eso fuerza el *present* por shader; con ambos en 0 el juego usa
   `glBlitFramebuffer`, que en AMD/Mesa deja la ventana en blanco. El
