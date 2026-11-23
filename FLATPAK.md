@@ -85,7 +85,7 @@ El script:
 Al terminar:
 
 ```sh
-flatpak run io.github.nicobm.GtiClubRecomp
+flatpak run --user io.github.nicobm.GtiClubRecomp
 ```
 
 También aparece en el menú como **Racing Club+**.

@@ -537,7 +537,7 @@ print_summary() {
 
 Racing Club+ está instalado como Flatpak de usuario:
 
-  flatpak run $APP_ID
+  flatpak run --user $APP_ID
 
 Los datos, partidas y ajustes se guardan en:
   ~/.var/app/$APP_ID/data/racing-club/game
