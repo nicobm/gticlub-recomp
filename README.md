@@ -21,7 +21,8 @@ el autor publica en Patreon. No redistribuyas `prebuilt/`, `re/`, `capture/`,
   red/PSN, pero el port no tiene pila de red: `socket()` falla y
   `sceNpManagerGetStatus` responde “offline”. Cambiar una IP no conecta nada.
 - **Flatpak + Wine:** es la vía recomendada para Linux y la que usa este
-  repositorio (`build-gti.sh`). Empaqueta el `Racing Club+.exe` ya compilado.
+  repositorio (`build-game-flatpak.sh`). Empaqueta el `Racing Club+.exe` ya
+  compilado.
 - **Audio:** el mixer MultiStream corre recompilado en un hilo aparte. En
   una VM/virgl el límite suele ser el renderizador, no el audio: si los
   frames tardan, el coche y el audio avanzan a tirones (ver
@@ -35,28 +36,29 @@ el autor publica en Patreon. No redistribuyas `prebuilt/`, `re/`, `capture/`,
 Requisitos:
 
 - Tu paquete de Patreon: `Racing Club+ Instalador.zip`.
-- `flatpak` en el host.
-- Un Toolbox de Fedora con `flatpak-builder` (el script lo instala con
-  `sudo dnf` si falta).
+- `flatpak` y `flatpak-builder` en el host, o Toolbox: si faltan, el script
+  entra (o crea) el contenedor `gticlub-recomp` y los instala dentro con
+  `sudo dnf`. Sin Toolbox solo imprime el comando del gestor de paquetes.
 - Runtimes de usuario: `org.freedesktop.Platform//26.08`,
-  `org.freedesktop.Sdk//26.08` y `org.winehq.Wine//stable-26.08`.
+  `org.freedesktop.Sdk//26.08` y `org.winehq.Wine//stable-26.08`. El script
+  los instala en el usuario si faltan.
 
 ```sh
 cd ~/Proyectos/gti
-bash build-gti.sh
+bash build-game-flatpak.sh
 flatpak run --user io.github.nicobm.GtiClubRecomp
 ```
 
 Si el zip no está en `~/Descargas` o `~/Documentos`, pasá la ruta:
 
 ```sh
-bash build-gti.sh "/ruta/Racing Club+ Instalador.zip"
+bash build-game-flatpak.sh "/ruta/Racing Club+ Instalador.zip"
 ```
 
 El `.rar`/`.zip` del ROM es opcional y se puede pasar en cualquier orden:
 
 ```sh
-bash build-gti.sh "/ruta/Racing Club+ Instalador.zip" "/ruta/GTI Club....rar"
+bash build-game-flatpak.sh "/ruta/Racing Club+ Instalador.zip" "/ruta/GTI Club....rar"
 ```
 
 El script:
@@ -65,9 +67,15 @@ El script:
 2. Extrae `Racing Club+/` a `prebuilt/` (ignorado por git).
 3. Verifica `Racing Club+.exe`, `juego/EBOOT.elf` (SHA1 oficial), `data` y
    `shadercache`.
-4. Instala/verifica los runtimes de usuario sin sudo.
-5. Construye el Flatpak con `flatpak-builder --user` dentro de Toolbox.
-6. Lo instala en el usuario desde el remoto local `gticlub-local`.
+4. Comprueba/instala los runtimes necesarios (Platform, SDK y Wine) sin sudo.
+5. Construye el Flatpak con `flatpak-builder --user` y lo exporta a `repo/`.
+6. Lo instala en el usuario desde el remoto local `gticlub-local`, separado
+   de Flathub, y lo deja desactivado.
+
+`flatpak-builder` puede separar símbolos de depuración en
+`io.github.nicobm.GtiClubRecomp.Debug`. No hace falta para jugar: el script no
+lo instala y quita el que haya dejado un build anterior. Usá `--debug` si lo
+querés para `gdb`.
 
 La primera ejecución copia el juego (~440 MB) a:
 
@@ -342,7 +350,7 @@ Ver [Estado](#estado).
 | `src/tools/` | `recomp_boot`, `ep3tool`, pruebas y herramientas. |
 | `flatpak/` | Lanzador, `.desktop`, icono y metainfo del Flatpak. |
 | `tools/*.py` | Ingeniería inversa, exportadores y utilidades. |
-| `build-gti.sh` | Empaquetado e instalación del Flatpak. |
+| `build-game-flatpak.sh` | Empaquetado e instalación del Flatpak. |
 | `prebuilt/` | Juego extraído del paquete de Patreon (ignorado por git). |
 | `docs/` | Notas de físicas, imports de PS3 y formato de UI. |
 

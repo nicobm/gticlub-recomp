@@ -14,9 +14,9 @@ src/recomp/spu_gen/
 *.edat
 *.mp4
 
-# --- build-gti.sh: artefactos locales ---
-build-gti/
-game-data/
+# --- build-game-flatpak.sh: artefactos locales ---
+build-dir/
+repo/
 prebuilt/
 .flatpak/
 .flatpak-builder/

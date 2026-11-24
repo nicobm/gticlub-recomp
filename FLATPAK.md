@@ -1,8 +1,8 @@
 # Racing Club+ como Flatpak
 
-`build-gti.sh` empaqueta **Racing Club+ ya compilado** en un Flatpak que lo
-ejecuta con **Wine**. No compila el juego, no usa RPCS3 y no necesita el
-toolchain de mingw.
+`build-game-flatpak.sh` empaqueta **Racing Club+ ya compilado** en un Flatpak
+que lo ejecuta con **Wine**. No compila el juego, no usa RPCS3 y no necesita
+el toolchain de mingw.
 
 El paquete de Patreon incluye:
 
@@ -26,8 +26,11 @@ El script extrae solo esa carpeta del zip, verifica el `EBOOT.elf` oficial
 - El zip del paquete de Patreon (`Racing Club+ Instalador.zip`) en XDG
   Downloads o Documents, o pasarle la ruta. El `.rar`/`.zip` del ROM es
   opcional; se acepta e ignora si el paquete ya trae el juego compilado.
-- `flatpak` en el host.
-- Toolbox con `flatpak-builder` (el script lo instala con `sudo dnf` si falta).
+- `flatpak` y `flatpak-builder` en el host. En Fedora Atomic el script entra
+  (o crea) el contenedor Toolbox `gticlub-recomp` y los instala dentro con
+  `sudo dnf`; usá `GTI_TOOLBOX=otro-nombre` para elegir otro contenedor. Sin
+  Toolbox (Debian, Arch, Alpine, Fedora normal, ...) no toca el host: imprime
+  el comando del gestor de paquetes detectado.
 - Los runtimes de **usuario** de Flathub:
   - `org.freedesktop.Platform//26.08`
   - `org.freedesktop.Sdk//26.08` (solo para `flatpak-builder`)
@@ -39,26 +42,26 @@ El script los instala en el usuario si faltan; **no pide sudo**.
 
 ```sh
 cd ~/Proyectos/gti
-bash build-gti.sh
+bash build-game-flatpak.sh
 ```
 
 Si el zip no está en Downloads/Documents:
 
 ```sh
-bash build-gti.sh "/ruta/Racing Club+ Instalador.zip"
+bash build-game-flatpak.sh "/ruta/Racing Club+ Instalador.zip"
 ```
 
 o una carpeta ya extraída:
 
 ```sh
-bash build-gti.sh "/ruta/Racing Club+"
+bash build-game-flatpak.sh "/ruta/Racing Club+"
 ```
 
 El script también acepta el `.rar`/`.zip` del ROM, en **cualquier orden**:
 
 ```sh
-bash build-gti.sh "/ruta/Racing Club+ Instalador.zip" "/ruta/GTI Club...rar"
-bash build-gti.sh "/ruta/GTI Club...rar" "/ruta/Racing Club+ Instalador.zip"
+bash build-game-flatpak.sh "/ruta/Racing Club+ Instalador.zip" "/ruta/GTI Club...rar"
+bash build-game-flatpak.sh "/ruta/GTI Club...rar" "/ruta/Racing Club+ Instalador.zip"
 ```
 
 El ROM es **opcional**: el paquete de Patreon ya trae el juego compilado y los
@@ -78,9 +81,23 @@ El script:
 3. Verifica `Racing Club+.exe`, `juego/EBOOT.elf` (SHA1 oficial), `data` y
    `shadercache`.
 4. Comprueba/instala los runtimes de usuario de Flathub (sin sudo).
-5. Construye el Flatpak con `flatpak-builder --user` dentro de Toolbox.
+5. Construye el Flatpak con `flatpak-builder --user` y lo exporta a `repo/`
+   (ignorado por git).
 6. Lo instala en tu usuario desde el remoto local `gticlub-local`, separado
-   de flathub, y lo deja desactivado.
+   de Flathub, y lo deja desactivado.
+
+El remoto local queda desactivado después de instalar: como la app se
+construye localmente, `flatpak update` no tiene nada que descargar. Para
+actualizarla, volvé a ejecutar `build-game-flatpak.sh`.
+
+`flatpak-builder` puede separar los símbolos de depuración en
+`io.github.nicobm.GtiClubRecomp.Debug`. No hace falta para jugar: el script no
+lo instala y quita el que haya dejado un build anterior. Si lo querés para
+`gdb`, ejecutá:
+
+```sh
+bash build-game-flatpak.sh --debug
+```
 
 Al terminar:
 
