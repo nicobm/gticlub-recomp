@@ -40,6 +40,12 @@ export WINEPREFIX="$DATA_HOME/wineprefix"
 export WINEARCH=win64
 export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
 
+# El juego usa 3 SPUs; 4 workers dejan CPU libre para el mixer MultiStream y
+# reducen los cortes de audio. El buffer del dispositivo da margen a los
+# tirones del host (1024 frames ≈ 21 ms a 48 kHz).
+export SPUS="${SPUS:-4}"
+export SDL_AUDIO_DEVICE_SAMPLE_FRAMES="${SDL_AUDIO_DEVICE_SAMPLE_FRAMES:-1024}"
+
 # Por defecto usamos OpenGL por hardware. En una VM con virtio-gpu el host
 # expone la GPU real vía virgl, pero el runtime necesita que le indiquemos el
 # driver; además virgl anuncia 4.3 y el juego pide 4.5 core, así que subimos

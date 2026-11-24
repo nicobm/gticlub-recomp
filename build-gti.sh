@@ -385,7 +385,7 @@ tune_prebuilt_ini() {
   # fallando por el renderer RSX).
   sed -i \
     -e 's/^pantalla_completa=.*/pantalla_completa=0/' \
-    -e 's/^resolucion_interna=.*/resolucion_interna=0/' \
+    -e 's/^resolucion_interna=.*/resolucion_interna=1/' \
     -e 's/^imagenes_por_segundo=.*/imagenes_por_segundo=60/' \
     -e 's/^pantalla_120hz=.*/pantalla_120hz=0/' \
     -e 's/^antialiasing=.*/antialiasing=1/' \
@@ -416,6 +416,14 @@ verify_prebuilt() {
   printf '  Datos y shadercache: presentes\n'
 
   tune_prebuilt_ini
+
+  # La build de Patreon suma el LFE a estéreo (bajo muy fuerte y saturación
+  # con muchos motores). El código nuevo ya no lo hace; para el exe ya
+  # compilado, patch_lfe.py cambia esa ganancia sin recompilar. Es idempotente
+  # y, si la build no coincide, avisa y no toca nada.
+  if [[ -f "$REPO_DIR/patch_lfe.py" ]] && command -v python3 >/dev/null 2>&1; then
+    python3 "$REPO_DIR/patch_lfe.py" "$PREBUILT_DIR/Racing Club+.exe" || true
+  fi
 }
 
 # ---------------------------------------------------------------- Flatpak host

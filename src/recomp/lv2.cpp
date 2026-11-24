@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <deque>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <zlib.h>
@@ -1660,12 +1661,38 @@ void port_thread() {
             if (blocksOut % 1875 == 1874) { LOG("[snd] blocks holding data at read time, by distance from the read index: %llu %llu %llu %llu %llu %llu %llu %llu%c", (unsigned long long)relHist[0], (unsigned long long)relHist[1], (unsigned long long)relHist[2], (unsigned long long)relHist[3], (unsigned long long)relHist[4], (unsigned long long)relHist[5], (unsigned long long)relHist[6], (unsigned long long)relHist[7], 10); std::memset(relHist, 0, sizeof relHist); }
         }
         auto smp = [&](uint32_t i, uint32_t c) { uint32_t u; std::memcpy(&u, p + (i * g_ch + c) * 4, 4); u = __builtin_bswap32(u); if ((u & 0x7f800000) == 0x7f800000) u = 0; float f; std::memcpy(&f, &u, 4); return f; };
+        // Mezcla 8->2. El canal 3 (LFE/subwoofer) no se manda a estéreo por
+        // defecto: sumarlo a ambos parlantes dejaba el bajo enorme y saturaba
+        // cuando sonaban muchos motores a la vez. SNDLFE=<0..1> lo incluye;
+        // SNDGAIN escala la mezcla y el limitador suave evita el clipping duro.
+        static const float lfeGain = [] {
+            const char* e = std::getenv("SNDLFE");
+            return e ? std::clamp(float(std::atof(e)), 0.f, 1.f) : 0.f;
+        }();
+        static const float mixGain = [] {
+            const char* e = std::getenv("SNDGAIN");
+            return e ? std::clamp(float(std::atof(e)), 0.1f, 2.f) : 1.f;
+        }();
+        static const bool limiter = std::getenv("SNDNOLIMIT") == nullptr;
+        const auto soft = [](float x) {
+            const float a = std::fabs(x);
+            if (a <= 0.7f) return x;                                   // transparente por debajo de -3 dB
+            const float y = 0.7f + 0.3f * std::tanh((a - 0.7f) / 0.3f); // comprime los picos en vez de recortarlos
+            return x < 0 ? -y : y;
+        };
         for (uint32_t i = 0; i < 256; ++i) {
             float l = smp(i, 0), r = smp(i, 1);
-            if (g_ch >= 6) { const float c = smp(i, 2) * 0.707f + smp(i, 3) * 0.5f; l += c + smp(i, 4) * 0.707f; r += c + smp(i, 5) * 0.707f; }
+            if (g_ch >= 6) {
+                const float c = smp(i, 2) * 0.707f;
+                l += c + smp(i, 4) * 0.707f;
+                r += c + smp(i, 5) * 0.707f;
+                if (lfeGain > 0.f) { const float sub = smp(i, 3) * lfeGain; l += sub; r += sub; }
+            }
             if (g_ch >= 8) { l += smp(i, 6) * 0.707f; r += smp(i, 7) * 0.707f; }
-            out[2 * i] = std::clamp(l, -1.f, 1.f); out[2 * i + 1] = std::clamp(r, -1.f, 1.f);
+            l *= mixGain; r *= mixGain;
             peak = std::max(peak, std::max(std::fabs(l), std::fabs(r)));
+            if (limiter) { l = soft(l); r = soft(r); }
+            out[2 * i] = std::clamp(l, -1.f, 1.f); out[2 * i + 1] = std::clamp(r, -1.f, 1.f);
         }
         if (play) audio_out_push(out.data(), 256);
         { static FILE* wf = std::getenv("SNDWAV") ? std::fopen("snd_out.f32", "wb") : nullptr; if (wf) std::fwrite(out.data(), 4, 512, wf); }   // debug: raw stereo float dump

@@ -121,7 +121,8 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club
 
 ## Permisos del sandbox
 
-- `--share=network`: online.
+- `--share=network`: red (el port todavía no implementa la pila de red; el
+  menú online/LAN del juego no conecta).
 - `--filesystem=home`: el Flatpak puede ver tu carpeta personal
   (`~/Documentos`, `~/Descargas`, etc.). Es para que un file browser o el
   instalador puedan elegir archivos; el juego prebuilt no lo necesita.
