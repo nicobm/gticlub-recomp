@@ -22,9 +22,10 @@ el autor publica en Patreon. No redistribuyas `prebuilt/`, `re/`, `capture/`,
   `sceNpManagerGetStatus` responde “offline”. Cambiar una IP no conecta nada.
 - **Flatpak + Wine:** es la vía recomendada para Linux y la que usa este
   repositorio (`build-gti.sh`). Empaqueta el `Racing Club+.exe` ya compilado.
-- **Audio:** el mixer MultiStream corre recompilado en un hilo aparte. El
-  canal LFE se omite por defecto desde la revisión de audio (ver
-  [Audio](#audio)); hay un parche binario para la build ya instalada.
+- **Audio:** el mixer MultiStream corre recompilado en un hilo aparte. En
+  una VM/virgl el límite suele ser el renderizador, no el audio: si los
+  frames tardan, el coche y el audio avanzan a tirones (ver
+  [Rendimiento](#rendimiento)).
 - **Gráficos:** OpenGL 4.5. En Wayland usa el driver Wayland de Wine y X11
   solo como fallback. En una VM con `virtio-gpu`/virgl el lanzador detecta el
   dispositivo y ajusta Mesa automáticamente.
@@ -189,6 +190,75 @@ Después del primer arranque se cambia desde el menú **F1** del juego.
   `--env=RACING_CLUB_RESET_GLCACHE=1`. Conservar el del autor:
   `--env=RACING_CLUB_KEEP_GLCACHE=1`.
 
+## Rendimiento
+
+El juego avanza su lógica **por imagen**. Si una imagen tarda 50-90 ms, el
+coche acelera/frena solo y el audio tironea con él. No es un problema de CPU
+(o de RAM): en una VM con `virtio-gpu`/virgl el cuello suele ser el
+**renderizador**.
+
+Cómo medirlo:
+
+```sh
+flatpak run --user \
+  --env=SPUS=4 \
+  --env=FPSLOG=1 \
+  --env=SWAPLOG=1 \
+  io.github.nicobm.GtiClubRecomp
+```
+
+y después:
+
+```sh
+grep -E '\[fps\]|\[pace\]|\[hitch\]|\[margin\]|\[slowdraw\]|\[rsxprof\]|\[rsx\] surface' \
+  ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club/game/recomp_log.txt | tail -100
+```
+
+Señales de que el renderizador es el límite:
+
+- `[fps]` por debajo de 60 de forma sostenida.
+- `[margin] ... the RSX finished up to X ms after it` con X > 16.7 ms.
+- `[pace]` con muchas imágenes de más de 25 ms.
+- `[hitch] 67 ms without a flip` repetido (4 frames de 60 Hz perdidos).
+
+### Probar 30 fps estables
+
+Si el renderizador no llega a 60, forzar 30 Hz suele dar una experiencia
+mucho más pareja: el paso de física se escala (`60/30`) y el coche mantiene
+la velocidad correcta.
+
+```sh
+flatpak run --user \
+  --env=GAMEHZ=30 \
+  --env=SPUS=4 \
+  io.github.nicobm.GtiClubRecomp
+```
+
+No es 60 fps, pero deja de ir “rápido-lento-rápido”. Si con 30 Hz va parejo,
+el límite es el renderizador.
+
+### Palancas para acercarse a 60
+
+- **Calidad del juego:** en el menú del juego buscá opciones de calidad,
+  sombras y texturas (`SelectGame_Quality_Icon`, `m_uiShadowResolution`,
+  `m_uiTextureQualityBias`). Bajarlas reduce mucho el trabajo de virgl.
+- **Pantalla:** probá `pantalla_completa=1` (borderless) o `2`, y `vsync=0`
+  en `gtiport.ini`.
+- **Pacing:** `VBLANKTIMER=1` (timer de 60 Hz en vez del vblank del host),
+  `REFRESCO=0` (no cambiar el modo de pantalla), `FLIPNOW=1` (presentar sin
+  esperar vblank; puede rasgar).
+- **Perfilado:** `RSXPROF=1` imprime `[rsxprof]` (ms/s de uploads, draws,
+  esperas del ring). `[slowdraw]` avisa cuando un frame sube muchas texturas,
+  construye streams de vértices o compila programas.
+- **Superficies:** `[rsx] surface ...` muestra los tamaños reales. Si ves
+  `2560x1440`/`5120x1440` para una salida de 1280x720, el juego está
+  renderizando con MSAA; forzar 1x o bajar la resolución interna requiere
+  recompilar el port (no hay opción en `gtiport.ini`).
+- **GPU real:** para 60 fps sostenidos en esta escena, lo más efectivo es
+  ejecutar fuera de virgl (GPU passthrough o una máquina con GPU real). El
+  autor lo corre a 60 en una GPU nativa; virgl agrega mucha latencia por
+  llamada.
+
 ## Audio
 
 El juego mezcla con **MultiStream**: una tarea SPU recompilada produce bloques
@@ -201,34 +271,9 @@ Variables útiles:
 |---|---|
 | `SPUS=3` o `SPUS=4` | workers de geometría (el lanzador usa `4`; el juego solo necesita 3) |
 | `SDL_AUDIO_DEVICE_SAMPLE_FRAMES=1024` / `2048` | buffer del dispositivo (el lanzador usa `1024`) |
-| `SNDLFE=0.0` | omite el canal LFE en la mezcla estéreo (por defecto) |
-| `SNDGAIN=0.8` | baja la mezcla general antes del limitador |
-| `SNDNOLIMIT=1` | desactiva el limitador suave |
 | `SNDWAV=1` | escribe `snd_out.f32` (PCM crudo) para diagnosticar |
 | `SNDPROF=1` | hotspots del intérprete de SPU cada 10 s |
 | `SNDTRACE=1` | traza detallada de la tarea de audio |
-
-### Arreglar el bajo saturado en una build ya instalada
-
-El recomp sumaba el canal 3 (LFE) a ambos parlantes con ganancia 0.5. En
-estéreo eso deja el bajo enorme y satura con muchos motores. El código
-(`src/recomp/lv2.cpp`) ya lo omite, pero para la build de Patreon que ya está
-instalada hay un parche binario que no requiere recompilar:
-
-```sh
-python3 patch_lfe.py \
-  "$HOME/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club/game/Racing Club+.exe"
-```
-
-- Por defecto pone `SNDLFE=0.0` (LFE fuera).
-- Guarda `Racing Club+.exe.lfe-backup` la primera vez.
-- Si la build no es la esperada, no toca nada.
-- Para dejar algo de LFE: `python3 patch_lfe.py --lfe 0.15 ".../Racing Club+.exe"`.
-- Para ver qué haría: `--dry-run`.
-
-En este repositorio local, `prebuilt/Racing Club+.exe` ya está parcheado. Si
-volvés a extraer el paquete de Patreon, corré `patch_lfe.py` otra vez sobre el
-exe extraído (o sobre el instalado) antes de jugar.
 
 ## Controles
 
@@ -269,9 +314,12 @@ Flatpak o poné `--env=MESA_DEBUG=silent`.
 
 ### El audio se corta o satura
 
+En esta build el audio suele ser un síntoma del renderizador: si los frames
+tardan, el mixer también se atrasa. Para confirmarlo, mirá sobre todo
+`[pace]`/`[margin]` (ver [Rendimiento](#rendimiento)).
+
 1. Probá `--env=SPUS=3` y `--env=SDL_AUDIO_DEVICE_SAMPLE_FRAMES=1024`.
-2. Aplicá el parche de LFE de arriba.
-3. Mirá las líneas `[snd]` del log:
+2. Mirá las líneas `[snd]` del log:
 
 ```sh
 grep '\[snd\]' \
@@ -295,7 +343,6 @@ Ver [Estado](#estado).
 | `flatpak/` | Lanzador, `.desktop`, icono y metainfo del Flatpak. |
 | `tools/*.py` | Ingeniería inversa, exportadores y utilidades. |
 | `build-gti.sh` | Empaquetado e instalación del Flatpak. |
-| `patch_lfe.py` | Parche binario del LFE para la build compilada. |
 | `prebuilt/` | Juego extraído del paquete de Patreon (ignorado por git). |
 | `docs/` | Notas de físicas, imports de PS3 y formato de UI. |
 
