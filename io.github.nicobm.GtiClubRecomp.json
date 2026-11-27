@@ -29,6 +29,14 @@
                 "install -Dm644 io.github.nicobm.GtiClubRecomp.svg /app/share/icons/hicolor/scalable/apps/io.github.nicobm.GtiClubRecomp.svg",
                 "install -Dm644 io.github.nicobm.GtiClubRecomp.metainfo.xml /app/share/metainfo/io.github.nicobm.GtiClubRecomp.metainfo.xml"
             ],
+            "cleanup": [
+                "/share/applications/org.winehq.Wine.desktop",
+                "/share/applications/winetricks.desktop",
+                "/share/icons/hicolor/*/apps/org.winehq.Wine.*",
+                "/share/icons/hicolor/*/apps/winetricks.*",
+                "/share/metainfo/org.winehq.Wine.metainfo.xml",
+                "/share/metainfo/io.github.winetricks.Winetricks.metainfo.xml"
+            ],
             "sources": [
                 {
                     "type": "dir",
