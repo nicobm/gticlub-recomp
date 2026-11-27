@@ -47,41 +47,27 @@ export SPUS="${SPUS:-4}"
 export SDL_AUDIO_DEVICE_SAMPLE_FRAMES="${SDL_AUDIO_DEVICE_SAMPLE_FRAMES:-1024}"
 
 # Por defecto usamos OpenGL por hardware. En una VM con virtio-gpu el host
-# expone la GPU real vía virgl, pero el runtime necesita que le indiquemos el
-# driver; además virgl anuncia 4.3 y el juego pide 4.5 core, así que subimos
-# la versión anunciada. En una GPU real no se toca nada.
+# expone la GPU real vía virgl, que anuncia OpenGL 4.3; el juego pide 4.5
+# core, así que subimos la versión anunciada. Es la única variable de Mesa
+# que hace falta. En una GPU real no se toca nada.
 # RACING_CLUB_SOFTWARE_GL=1 fuerza llvmpipe.
 # RACING_CLUB_VIRTIO=1 fuerza el modo virtio si /sys no es legible.
 if [ "${RACING_CLUB_SOFTWARE_GL:-0}" = "1" ]; then
     export LIBGL_ALWAYS_SOFTWARE=1
     echo "Racing Club+: OpenGL por software (llvmpipe)."
 else
-    unset LIBGL_ALWAYS_SOFTWARE
     IS_VIRTIO=0
     if [ "${RACING_CLUB_VIRTIO:-0}" = "1" ] ||
         grep -qi 'virtio' /sys/class/drm/card0/device/uevent 2>/dev/null; then
         IS_VIRTIO=1
     fi
     if [ "$IS_VIRTIO" = "1" ]; then
-        export MESA_LOADER_DRIVER_OVERRIDE="${MESA_LOADER_DRIVER_OVERRIDE:-virtio_gpu}"
         export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-4.5}"
-        export MESA_GLSL_VERSION_OVERRIDE="${MESA_GLSL_VERSION_OVERRIDE:-450}"
         echo "Racing Club+: OpenGL por hardware (virtio/virgl)."
     else
         echo "Racing Club+: OpenGL por hardware."
     fi
 fi
-
-# El juego usa OpenGL (virgl), no Vulkan. radv de Mesa 26 enumera todos los
-# render nodes y falla contra virtio-gpu, llenando la terminal de errores
-# ("vdrm_device_connect failed", "radv/amdgpu"). Sin ICDs de Vulkan ese ruido
-# desaparece. RACING_CLUB_VULKAN=1 lo deja como estaba. MESA_DEBUG se puede
-# vaciar para depurar (MESA_DEBUG=).
-if [ "${RACING_CLUB_VULKAN:-0}" != "1" ]; then
-    export VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/nonexistent}"
-    export VK_DRIVER_FILES="${VK_DRIVER_FILES:-/nonexistent}"
-fi
-export MESA_DEBUG="${MESA_DEBUG-silent}"
 
 # El glcache del paquete es de la GPU del autor; en otra GPU los binarios se
 # rechazan y el juego recompila. Se borra UNA sola vez: si se borra en cada
@@ -95,16 +81,13 @@ elif [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ] && [ ! -e "$GAME_DIR/.glcache-c
     rm -rf "$GAME_DIR/glcache"
     : > "$GAME_DIR/.glcache-cleaned"
 fi
-# Wayland es la vía principal; X11 queda solo como fallback. Flatpak puede
-# exponer DISPLAY=:0 junto con WAYLAND_DISPLAY (XWayland), y en ese caso Wine
-# elige X11. Si hay Wayland, quitamos DISPLAY para que use el driver Wayland;
-# si no hay Wayland, DISPLAY queda para el fallback X11.
-if [ -n "${WAYLAND_DISPLAY:-}" ]; then
-    unset DISPLAY
-    echo "Racing Club+: Wine sobre Wayland."
-elif [ -n "${DISPLAY:-}" ]; then
-    echo "Racing Club+: Wine sobre X11 (fallback)."
+# Solo Wayland: el manifiesto no expone X11 ni XWayland, así que Wine usa su
+# driver nativo Wayland (winewayland) para el contexto WGL.
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "Racing Club+: hace falta una sesión Wayland (este Flatpak ya no incluye X11)." >&2
+    exit 1
 fi
+echo "Racing Club+: Wine sobre Wayland."
 
 # El juego usa OpenGL. winevulkan=d evita que Wine intente radv/Vulkan.
 export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d}"

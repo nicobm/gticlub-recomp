@@ -27,9 +27,9 @@ el autor publica en Patreon. No redistribuyas `prebuilt/`, `re/`, `capture/`,
   una VM/virgl el límite suele ser el renderizador, no el audio: si los
   frames tardan, el coche y el audio avanzan a tirones (ver
   [Rendimiento](#rendimiento)).
-- **Gráficos:** OpenGL 4.5. En Wayland usa el driver Wayland de Wine y X11
-  solo como fallback. En una VM con `virtio-gpu`/virgl el lanzador detecta el
-  dispositivo y ajusta Mesa automáticamente.
+- **Gráficos:** OpenGL 4.5, solo Wayland (Wine usa su driver Wayland nativo;
+  el Flatpak no expone X11). En una VM con `virtio-gpu`/virgl el lanzador
+  detecta el dispositivo y ajusta Mesa automáticamente.
 
 ## Camino rápido (Flatpak, recomendado)
 
@@ -180,19 +180,18 @@ Después del primer arranque se cambia desde el menú **F1** del juego.
 ## Gráficos
 
 - El juego pide **OpenGL 4.5 core**; no usa Vulkan.
-- **Wayland** es la vía principal. El lanzador quita `DISPLAY` si hay
-  `WAYLAND_DISPLAY`, porque Wine prefiere X11 cuando ve ambos.
-- **X11** queda como fallback (`--socket=fallback-x11`).
+- **Solo Wayland:** el manifiesto no expone X11 ni XWayland y Wine usa su
+  driver Wayland nativo. Si no hay sesión Wayland, el lanzador avisa y no
+  arranca.
 - En una **VM con virtio-gpu/virgl**, el lanzador detecta
-  `/sys/class/drm/card0/device/uevent` y aplica:
-  - `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu`
-  - `MESA_GL_VERSION_OVERRIDE=4.5`
-  - `MESA_GLSL_VERSION_OVERRIDE=450`
+  `/sys/class/drm/card0/device/uevent` y aplica
+  `MESA_GL_VERSION_OVERRIDE=4.5` (virgl anuncia 4.3 y el juego pide 4.5
+  core). Es la única variable de Mesa que hace falta.
 - **Software** (lento, pero funciona): `--env=RACING_CLUB_SOFTWARE_GL=1`.
 - **Forzar virtio** si `/sys` no es legible: `--env=RACING_CLUB_VIRTIO=1`.
-- **Vulkan:** el juego no lo usa; el lanzador deja el loader sin ICDs para
-  que `radv` no llene la terminal con `vdrm_device_connect failed`. Para
-  volver a habilitarlo: `--env=RACING_CLUB_VULKAN=1`.
+- **Vulkan:** el juego no lo usa; Wine lo mantiene desactivado con
+  `WINEDLLOVERRIDES` (`winevulkan=d;vulkan-1=d`) para que `radv` no llene la
+  terminal con `vdrm_device_connect failed`.
 - **Caché de shaders:** `glcache/` se borra una sola vez (el del autor es de
   otra GPU). Si se borrara en cada arranque, todo iría lento. Forzar borrado:
   `--env=RACING_CLUB_RESET_GLCACHE=1`. Conservar el del autor:
@@ -310,15 +309,16 @@ rm -f ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club/game/gtiport.in
 
 ### No abre ventana / `No matching GL pixel format available`
 
-- En Wayland, el lanzador ya prefiere Wayland.
+- El Flatpak es **solo Wayland**: hace falta una sesión Wayland (ya no
+  incluye X11 ni XWayland).
 - En una VM, probá `--env=RACING_CLUB_VIRTIO=1`.
 - Si el host no expone 3D, usá software: `--env=RACING_CLUB_SOFTWARE_GL=1`.
 
 ### `MESA: error: vdrm_device_connect failed` / `radv/amdgpu`
 
 Es ruido de Vulkan (`radv` enumera el virtio-gpu y falla). El juego usa
-OpenGL. La build normal ya desactiva esos ICDs; si ves el ruido, actualizá el
-Flatpak o poné `--env=MESA_DEBUG=silent`.
+OpenGL; Wine mantiene Vulkan desactivado con `winevulkan=d;vulkan-1=d`. Si
+igual aparece, actualizá el Flatpak.
 
 ### El audio se corta o satura
 

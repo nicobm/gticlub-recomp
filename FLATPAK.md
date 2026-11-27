@@ -145,7 +145,7 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp/data/racing-club
   instalador puedan elegir archivos; el juego prebuilt no lo necesita.
 - `--nofilesystem=host`: sin acceso al resto del sistema (`/`, `/usr`, otros
   usuarios, etc.).
-- `--socket=wayland`, `--socket=fallback-x11`, `--socket=pulseaudio`,
+- `--socket=wayland`, `--socket=pulseaudio`,
   `--device=dri`, `--device=input`: pantalla, sonido, GPU y mandos.
 
 Si no querés exponer todo el home, se puede cambiar `--filesystem=home` por
@@ -178,16 +178,13 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
 - El `.rar`/`.zip` del ROM no se usa para este camino: el paquete de Patreon
   ya trae `juego/EBOOT.elf` y `juego/USRDIR`. Se acepta como argumento para
   que puedas pasarlo, pero no se extrae.
-- El juego usa **OpenGL**, no Vulkan. El lanzador desactiva `winevulkan` y,
-  por defecto, deja al loader de Vulkan sin ICDs (`VK_ICD_FILENAMES` y
-  `VK_DRIVER_FILES` a `/nonexistent`) para que `radv` no llene la terminal
-  con `vdrm_device_connect failed`. Para volver a habilitar Vulkan:
-  `--env=RACING_CLUB_VULKAN=1`. `MESA_DEBUG` queda en `silent`; para depurar:
-  `--env=MESA_DEBUG=`.
+- El juego usa **OpenGL**, no Vulkan. Wine lo mantiene desactivado con
+  `WINEDLLOVERRIDES` (`winevulkan=d;vulkan-1=d`) para que `radv` no llene la
+  terminal con `vdrm_device_connect failed`.
 - El lanzador usa **OpenGL por hardware** por defecto. En una VM con
   `virtio-gpu`/virgl detecta el dispositivo y aplica
-  `MESA_LOADER_DRIVER_OVERRIDE=virtio_gpu` y los overrides de versión 4.5
-  (virgl anuncia 4.3 y el juego pide 4.5 core). Para forzar software:
+  `MESA_GL_VERSION_OVERRIDE=4.5` (virgl anuncia 4.3 y el juego pide 4.5
+  core). Es la única variable de Mesa necesaria. Para forzar software:
   ```sh
   flatpak run --user --env=RACING_CLUB_SOFTWARE_GL=1 \
       io.github.nicobm.GtiClubRecomp
@@ -200,11 +197,9 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   borrado: `--env=RACING_CLUB_RESET_GLCACHE=1`. Para conservar incluso el del
   autor: `--env=RACING_CLUB_KEEP_GLCACHE=1`.
 - El juego es un `.exe` de Windows: SDL crea el contexto con **WGL**, que Wine
-  traduce al driver **Wayland** (preferido) o X11 (fallback). El manifiesto
-  usa `--socket=wayland` y `--socket=fallback-x11`. Flatpak puede exponer
-  `DISPLAY=:0` junto con `WAYLAND_DISPLAY`; el lanzador quita `DISPLAY` si
-  hay Wayland para que Wine no elija X11. Sin Wayland, `DISPLAY` queda como
-  fallback.
+  traduce con su driver **Wayland** nativo. El manifiesto solo expone
+  `--socket=wayland`: sin X11 ni XWayland, Wine no puede caer en X11. Si no
+  hay sesión Wayland, el lanzador avisa y no arranca.
 - El modo virtio/virgl se activa solo si
   `/sys/class/drm/card0/device/uevent` contiene `virtio`; si el sandbox no
   puede leerlo, forzalo con `--env=RACING_CLUB_VIRTIO=1`. Si la VM no tiene
