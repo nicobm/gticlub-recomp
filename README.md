@@ -185,16 +185,18 @@ Después del primer arranque se cambia desde el menú **F1** del juego.
   - **virtio-gpu/virgl** (VM): **OpenGL**;
   - **GPU real**: **Vulkan** (si no está disponible, el juego vuelve solo a
     OpenGL).
-- **Solo Wayland:** el manifiesto no expone X11 ni XWayland y Wine usa su
-  driver Wayland nativo. Si no hay sesión Wayland, el lanzador avisa y no
-  arranca.
+- **Solo Wayland:** el manifiesto no expone X11 ni XWayland, el lanzador
+  exige `WAYLAND_DISPLAY` y fija el driver gráfico de Wine en wayland
+  (`HKCU\Software\Wine\Drivers\Graphics=wayland`), así que nunca prueba X11.
 - En una **VM con virtio-gpu/virgl**, además de forzar OpenGL aplica
   `MESA_GL_VERSION_OVERRIDE=4.5` (virgl anuncia 4.3 y el juego pide 4.5
   core) y apaga los ICDs de Vulkan: la VM no tiene Vulkan salvo que se
   habilite Venus en QEMU.
-- **Elegir renderizador a mano:** `--env=RENDERER=gl`, `vulkan` o `d3d11`
-  (el lanzador no lo pisa; tiene prioridad sobre la opción del menú F1).
-- **Software** (lento, pero funciona): `--env=RACING_CLUB_SOFTWARE_GL=1`.
+- **Elegir renderizador a mano:** `--env=RACING_CLUB_RENDERER=gl`, `vulkan`,
+  `d3d11` o `soft` (también se acepta `--env=RENDERER=...`). Tiene prioridad
+  sobre la elección automática y sobre la opción del menú F1.
+- **Software** (lento, pero funciona): `--env=RACING_CLUB_RENDERER=soft` o
+  `--env=RACING_CLUB_SOFTWARE_GL=1`.
 - **Forzar virtio/virgl** si `/sys` no es legible: `--env=RACING_CLUB_VIRTIO=1`.
 - **Caché de shaders:** `glcache/` se borra una sola vez (el del autor es de
   otra GPU). Si se borrara en cada arranque, todo iría lento. Forzar borrado:

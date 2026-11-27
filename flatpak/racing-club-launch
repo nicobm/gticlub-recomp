@@ -46,40 +46,82 @@ export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
 export SPUS="${SPUS:-4}"
 export SDL_AUDIO_DEVICE_SAMPLE_FRAMES="${SDL_AUDIO_DEVICE_SAMPLE_FRAMES:-1024}"
 
-# Detectamos la GPU virtual de la VM: virtio-gpu, cuyo OpenGL lo da virgl.
-# virgl no aparece como dispositivo aparte en /sys; su marca es justamente el
-# nodo virtio-gpu. Con una GPU real (aunque esté pasada a la VM) no hay nodo
-# virtio. RACING_CLUB_VIRTIO=1 fuerza este modo si /sys no es legible.
+# ---- Renderizador ----
+# El port puede dibujar con OpenGL, DirectX 11 o Vulkan. En una VM con
+# virtio-gpu el OpenGL lo da virgl y no hay Vulkan salvo que el host habilite
+# Venus en QEMU, así que ahí usamos OpenGL. En una GPU real preferimos el
+# backend Vulkan del port; si Vulkan 1.3 no está disponible, el juego vuelve
+# solo a OpenGL.
+#
+# RACING_CLUB_RENDERER=gl|vulkan|d3d11|soft tiene la última palabra (también
+# se acepta RENDERER=..., que es lo que lee el juego). RACING_CLUB_SOFTWARE_GL=1
+# es lo mismo que soft (llvmpipe). RACING_CLUB_VIRTIO=1 fuerza el modo
+# virtio/virgl si el sandbox no puede leer /sys.
 IS_VIRTIO=0
 if [ "${RACING_CLUB_VIRTIO:-0}" = "1" ] ||
     grep -qi 'virtio' /sys/class/drm/card*/device/uevent 2>/dev/null; then
     IS_VIRTIO=1
 fi
 
-# Renderizador: en virtio-gpu/virgl, OpenGL (virgl anuncia 4.3 y el juego pide
-# 4.5 core, así que subimos la versión anunciada); en una GPU real, Vulkan.
-# Si Vulkan no está disponible, el juego vuelve solo a OpenGL.
-# RENDERER=gl|vulkan|d3d11 (o --env=RENDERER=...) tiene la última palabra.
-# RACING_CLUB_SOFTWARE_GL=1 fuerza llvmpipe.
+RENDERER="${RACING_CLUB_RENDERER:-${RENDERER:-}}"
 if [ "${RACING_CLUB_SOFTWARE_GL:-0}" = "1" ]; then
-    export LIBGL_ALWAYS_SOFTWARE=1
-    export RENDERER="${RENDERER:-gl}"
-    echo "Racing Club+: OpenGL por software (llvmpipe)."
-elif [ "$IS_VIRTIO" = "1" ]; then
-    export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-4.5}"
-    export RENDERER="${RENDERER:-gl}"
-    # La VM no ofrece Vulkan (Venus hay que habilitarlo en QEMU): apagamos los
-    # ICDs para que la enumeración de DXGI al arrancar no llene la terminal.
-    export VK_DRIVER_FILES="${VK_DRIVER_FILES-/nonexistent}"
-    echo "Racing Club+: OpenGL por hardware (virtio/virgl)."
-else
-    export RENDERER="${RENDERER:-vulkan}"
-    case "$RENDERER" in
-        gl)     echo "Racing Club+: OpenGL por hardware." ;;
-        vulkan) echo "Racing Club+: Vulkan (vuelve a OpenGL si no está disponible)." ;;
-        *)      echo "Racing Club+: $RENDERER (vuelve a OpenGL si no está disponible)." ;;
-    esac
+    RENDERER=soft
+elif [ -z "$RENDERER" ]; then
+    if [ "$IS_VIRTIO" = "1" ]; then RENDERER=gl; else RENDERER=vulkan; fi
 fi
+
+# Solo Wayland: el manifiesto no expone X11 y además fijamos el driver gráfico
+# de Wine en wayland. Sin WAYLAND_DISPLAY no hay nada que hacer.
+if [ -z "${WAYLAND_DISPLAY:-}" ]; then
+    echo "Racing Club+: hace falta una sesión Wayland (este Flatpak ya no incluye X11)." >&2
+    exit 1
+fi
+
+case "$RENDERER" in
+    soft)
+        unset MESA_GL_VERSION_OVERRIDE MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER
+        export LIBGL_ALWAYS_SOFTWARE=1
+        SOFT_GL=1
+        GAME_RENDERER=gl
+        ;;
+    gl)
+        unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE
+        if [ "$IS_VIRTIO" = "1" ]; then
+            export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-4.5}"
+            # En una VM virtio solo hay Vulkan si el host habilita Venus en
+            # QEMU. Apagamos los ICDs para que nada intente enumerarlo.
+            export VK_DRIVER_FILES="${VK_DRIVER_FILES-/nonexistent}"
+        fi
+        GAME_RENDERER=gl
+        ;;
+    vulkan)
+        unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE
+        GAME_RENDERER=vulkan
+        ;;
+    d3d11)
+        unset MESA_LOADER_DRIVER_OVERRIDE GALLIUM_DRIVER LIBGL_ALWAYS_SOFTWARE
+        GAME_RENDERER=d3d11
+        ;;
+    *)
+        echo "Racing Club+: renderizador desconocido '$RENDERER' (usá gl, vulkan, d3d11 o soft)." >&2
+        exit 1
+        ;;
+esac
+export RENDERER="$GAME_RENDERER"
+
+case "$GAME_RENDERER" in
+    gl)
+        if [ "${SOFT_GL:-0}" = "1" ]; then
+            echo "Racing Club+: OpenGL por software (llvmpipe)."
+        elif [ "$IS_VIRTIO" = "1" ]; then
+            echo "Racing Club+: OpenGL por hardware (virtio/virgl)."
+        else
+            echo "Racing Club+: OpenGL por hardware."
+        fi
+        ;;
+    vulkan) echo "Racing Club+: Vulkan (vuelve a OpenGL si no está disponible)." ;;
+    d3d11)  echo "Racing Club+: DirectX 11 (vuelve a OpenGL si no está disponible)." ;;
+esac
 
 # El glcache del paquete es de la GPU del autor; en otra GPU los binarios se
 # rechazan y el juego recompila. Se borra UNA sola vez: si se borra en cada
@@ -93,20 +135,13 @@ elif [ "${RACING_CLUB_KEEP_GLCACHE:-0}" != "1" ] && [ ! -e "$GAME_DIR/.glcache-c
     rm -rf "$GAME_DIR/glcache"
     : > "$GAME_DIR/.glcache-cleaned"
 fi
-# Solo Wayland: el manifiesto no expone X11 ni XWayland, así que Wine usa su
-# driver nativo Wayland (winewayland) para el contexto WGL.
-if [ -z "${WAYLAND_DISPLAY:-}" ]; then
-    echo "Racing Club+: hace falta una sesión Wayland (este Flatpak ya no incluye X11)." >&2
-    exit 1
+# Vulkan de Windows (winevulkan) solo se deja activo para el backend Vulkan;
+# con OpenGL o DirectX 11 se desactiva para que Wine ni lo intente.
+if [ "$GAME_RENDERER" = "vulkan" ]; then
+    DEF_OVERRIDES="mscoree=d;mshtml=d"
+else
+    DEF_OVERRIDES="mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d"
 fi
-echo "Racing Club+: Wine sobre Wayland."
-
-# Vulkan solo se deja disponible si el renderizador elegido lo va a usar.
-# En OpenGL (virtio/virgl o software) winevulkan=d evita que Wine lo intente.
-case "${RENDERER:-}" in
-    gl) DEF_OVERRIDES="mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d" ;;
-    *)  DEF_OVERRIDES="mscoree=d;mshtml=d" ;;
-esac
 export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-$DEF_OVERRIDES}"
 
 if [ -x /app/bin/wine ]; then WINE=/app/bin/wine; else WINE=wine; fi
@@ -116,6 +151,11 @@ if [ ! -d "$WINEPREFIX/drive_c" ]; then
     echo "Racing Club+: preparando el prefijo de Wine (primera vez)..."
     "$WINEBOOT" -u >/dev/null 2>&1 || true
 fi
+
+# 100 % Wayland: además de no exponer X11, fijamos el driver gráfico de Wine
+# en wayland para que nunca intente X11 (el equivalente a SDL_VIDEODRIVER).
+"$WINE" reg add 'HKCU\Software\Wine\Drivers' /v Graphics /d wayland /f >/dev/null 2>&1 || true
+echo "Racing Club+: Wine sobre Wayland."
 
 cd "$GAME_DIR"
 exec "$WINE" "$GAME_DIR/Racing Club+.exe" "$@"

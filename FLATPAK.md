@@ -184,10 +184,11 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   `MESA_GL_VERSION_OVERRIDE=4.5` (virgl anuncia 4.3 y el juego pide 4.5
   core) y apaga los ICDs de Vulkan, porque la VM no tiene Vulkan salvo que se
   habilite Venus en QEMU. Para elegir a mano:
-  `--env=RENDERER=gl`, `vulkan` o `d3d11` (tiene prioridad sobre el menú F1).
-  Para forzar software:
+  `--env=RACING_CLUB_RENDERER=gl`, `vulkan`, `d3d11` o `soft` (también se
+  acepta `--env=RENDERER=...`); tiene prioridad sobre el menú F1. Para forzar
+  software:
   ```sh
-  flatpak run --user --env=RACING_CLUB_SOFTWARE_GL=1 \
+  flatpak run --user --env=RACING_CLUB_RENDERER=soft \
       io.github.nicobm.GtiClubRecomp
   ```
   No uses `flatpak override`: cambia la configuración para todas las
@@ -199,8 +200,9 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
   autor: `--env=RACING_CLUB_KEEP_GLCACHE=1`.
 - El juego es un `.exe` de Windows: SDL crea el contexto con **WGL**, que Wine
   traduce con su driver **Wayland** nativo. El manifiesto solo expone
-  `--socket=wayland`: sin X11 ni XWayland, Wine no puede caer en X11. Si no
-  hay sesión Wayland, el lanzador avisa y no arranca.
+  `--socket=wayland` y el lanzador fija
+  `HKCU\Software\Wine\Drivers\Graphics=wayland` en el prefijo, así que Wine
+  nunca prueba X11. Si no hay sesión Wayland, avisa y no arranca.
 - El modo virtio/virgl se activa solo si
   `/sys/class/drm/card0/device/uevent` contiene `virtio`; si el sandbox no
   puede leerlo, forzalo con `--env=RACING_CLUB_VIRTIO=1`. Si la VM no tiene
