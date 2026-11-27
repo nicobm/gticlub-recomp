@@ -25,6 +25,11 @@
         "/share/metainfo/org.winehq.Wine.metainfo.xml",
         "/share/metainfo/io.github.winetricks.Winetricks.metainfo.xml"
     ],
+    "cleanup-commands": [
+        "rm -f /app/share/applications/org.winehq.Wine.desktop /app/share/applications/winetricks.desktop",
+        "rm -f /app/share/icons/hicolor/*/apps/org.winehq.Wine.* /app/share/icons/hicolor/scalable/apps/winetricks.svg",
+        "rm -f /app/share/metainfo/org.winehq.Wine.metainfo.xml /app/share/metainfo/io.github.winetricks.Winetricks.metainfo.xml"
+    ],
     "modules": [
         {
             "name": "racing-club",
