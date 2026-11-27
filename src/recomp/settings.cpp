@@ -35,6 +35,10 @@ const Field kFields[] = {
     {"nitidez", &Settings::sharpen, 0, 3},
     {"modo_directo", &Settings::streaming, 0, 1},
     {"filtrado_anisotropo", &Settings::aniso, 0, 4},
+    {"camara", &Settings::camera, 0, 16},
+    {"renderizador", &Settings::renderer, 0, 2},
+    {"iconos_botones", &Settings::buttons, 0, 3},
+    {"online", &Settings::online, 0, 1},
 };
 }
 
@@ -51,6 +55,14 @@ Settings& settings() {
                 *eq = 0;
                 for (const Field& fd : kFields)
                     if (!std::strcmp(line, fd.name)) s.*fd.p = std::clamp(std::atoi(eq + 1), fd.lo, fd.hi);
+                auto text = [&](const char* key, char* dst, size_t cap) {   // text values: up to the end of the line, printable ASCII
+                    if (std::strcmp(line, key)) return;
+                    size_t k = 0;
+                    for (const char* q = eq + 1; *q && *q != '\r' && *q != '\n' && k + 1 < cap; ++q) if (*q >= 32 && *q < 127) dst[k++] = *q;
+                    dst[k] = 0;
+                };
+                text("online_nombre", s.onlineName, sizeof s.onlineName);
+                text("online_ip", s.onlineIp, sizeof s.onlineIp);
             }
             std::fclose(f);
         }
@@ -66,6 +78,7 @@ void settings_save() {
     FILE* f = std::fopen(ini_path().c_str(), "w");
     if (!f) return;
     for (const Field& fd : kFields) std::fprintf(f, "%s=%d\n", fd.name, s.*fd.p);
+    std::fprintf(f, "online_nombre=%s\nonline_ip=%s\n", s.onlineName, s.onlineIp);
     std::fclose(f);
 }
 } // namespace gti::recomp

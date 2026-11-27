@@ -13,8 +13,14 @@ struct Settings {
     int streaming = 0;    // live streaming / recording: 60 images per second and the display at 120 Hz, whatever gameHz says
     int fxaa = 1;         // edge antialiasing pass on the final image
     int sharpen = 1;      // contrast-adaptive sharpening of the final image: 0 off, 1 low, 2 medium, 3 high
+    int camera = 1;       // the EyeToy / PlayStation Eye: 0 none, k = the k-th camera of the host
     int sound = 1;        // sound effects (the game's MultiStream mixer runs on a host thread)
     int showFps = 1;      // frame rate in the window title
+    int buttons = 0;      // button icons in the menus: 0 the controller connected, 1 PlayStation, 2 Xbox, 3 Nintendo
+    int renderer = 0;     // graphics API: 0 OpenGL, 1 Direct3D 11, 2 Vulkan (read at start; RENDERER=gl|d3d11|vulkan overrides)
+    int online = 1;       // online play (direct connection, src/recomp/netplay.cpp); NETPLAY=0|1 overrides
+    char onlineName[20] = "";   // player name online (empty: the Windows user name)
+    char onlineIp[64] = "";     // address of the friend who hosts (empty: only the local network)
 };
 Settings& settings();     // loaded from gtiport.ini on first use
 void settings_save();

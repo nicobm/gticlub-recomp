@@ -1,1 +1,29 @@
+#include <winver.h>
+
 1 ICON "../../assets/racing_club.ico"
+1 24 "instalador_launcher.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     2,1,0,0
+PRODUCTVERSION  2,1,0,0
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "0C0A04B0"
+    BEGIN
+      VALUE "CompanyName",      "Racing Club+"
+      VALUE "FileDescription",  "Instalador de Racing Club+"
+      VALUE "FileVersion",      "2.1.0.0"
+      VALUE "InternalName",     "instalador"
+      VALUE "OriginalFilename", "Instalar Racing Club+.exe"
+      VALUE "ProductName",      "Racing Club+"
+      VALUE "ProductVersion",   "2.1.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x0C0A, 1200
+  END
+END

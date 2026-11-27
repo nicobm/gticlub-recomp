@@ -16,6 +16,20 @@ extern uint64_t g_spuSlowEntries;
 void spu_slow_note(uint32_t ea, uint32_t pc);   // SPUPROF=1: where the slow variant is entered ([spuslow] report)
 void spu_slow_report();
 
+// native replacement of SPU routines, per program ((eaBin >> 4) % 64): called by the dispatcher whenever execution
+// crosses into another chunk (calls and returns between routines do); returns the pc to continue at (pc itself = not handled)
+using HleHook = uint32_t (*)(Q* __restrict r, Spu& s, uint32_t pc);
+extern HleHook g_spuHle[64];
+// the pcs a hook wants (up to 8; all 0 = every crossing): the dispatcher calls it only there (an indirect call on
+// every chunk crossing was 2-3 % of the Edge jobs)
+extern uint32_t g_spuHlePcs[64][8];
+inline bool spu_hle_wants(int k, uint32_t pc) {
+    const uint32_t* p = g_spuHlePcs[k];
+    uint32_t any = 0; bool hit = false;
+    for (int i = 0; i < 8; ++i) { hit |= pc == p[i]; any |= p[i]; }
+    return hit || any == 0;
+}
+
 // A chunk runs from pc until it leaves its 1 KB of code. Result: next pc, | 0x80000000 = the interpreter must
 // execute the instruction at that pc, | 0x40000000 (fast chunks only) = pc is not an entry point of the fast chunk.
 using FastChunk = uint32_t (*)(Q* __restrict, Spu&, uint32_t pc);

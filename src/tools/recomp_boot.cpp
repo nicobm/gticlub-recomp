@@ -16,6 +16,7 @@
 #include <thread>
 #ifdef _WIN32
 #include <windows.h>
+#include <io.h>
 #endif
 
 using namespace gti::recomp;
@@ -45,11 +46,20 @@ int main(int argc, char** argv) {
             std::printf("usage: recomp_boot EBOOT.elf USRDIR [--trace] [--seconds N]\n");
             return 1;
         }
-        std::freopen("recomp_log.txt", "w", stderr);
         seconds = 0;
 #ifdef _WIN32
-        FreeConsole();
+        FreeConsole();   // first: started from a console (a .bat with "start"), stderr is that console's handle
 #endif
+        // the log: the file takes over descriptor 2 itself (freopen alone left an empty file when the game was
+        // started from a .bat: the writes kept going to the console's handle)
+        if (FILE* lf = std::fopen(std::getenv("RECOMPLOG") ? std::getenv("RECOMPLOG") : "recomp_log.txt", "w")) {
+            std::fflush(stderr);
+            _dup2(_fileno(lf), 2);
+#ifdef _WIN32
+            SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(2)));
+#endif
+        }
+        std::setvbuf(stderr, nullptr, _IONBF, 0);   // the log survives however the game ends
     } else { elfArg = argv[1]; usrArg = argv[2]; }
     setvbuf(stdout, nullptr, _IONBF, 0);
     Lv2Config cfg;

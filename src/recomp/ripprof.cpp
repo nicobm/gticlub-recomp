@@ -65,7 +65,58 @@ static void sampler(double startSec) {
     }
     if (std::getenv("RIPTIME")) if (FILE* t = std::fopen("ripprof_t.txt", "w")) { for (float x : times) std::fprintf(t, "%.4f\n", x); std::fclose(t); }
 }
+// [cpu]: every 10 s, how much processor each named thread used (% of one core), busiest first. CPULOG=0: off.
+struct CpuThread { HANDLE h; char name[24]; uint64_t last; };
+static CpuThread g_cpu[64];
+static std::atomic<int> g_nCpu{0};
+// CPU cycles, not GetThreadTimes: that one charges whole clock ticks to the thread running at the tick, and
+// threads woken by the timer (vblank, audio) were shown at ~45 % each while sampling found them asleep
+static uint64_t thread_cycles(HANDLE h) { ULONG64 c = 0; QueryThreadCycleTime(h, &c); return c; }
+static void cpu_register(const char* name) {
+    if (const char* e = std::getenv("CPULOG"); e && e[0] == '0') return;
+    static std::mutex mx;
+    std::lock_guard<std::mutex> lk(mx);
+    const int i = g_nCpu.load();
+    if (i >= 64) return;
+    HANDLE h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentThreadId());
+    if (!h) return;
+    g_cpu[i].h = h; g_cpu[i].last = thread_cycles(h);
+    std::snprintf(g_cpu[i].name, sizeof g_cpu[i].name, "%s", name);
+    g_nCpu = i + 1;
+    if (i == 0) std::thread([] {
+        HANDLE proc = GetCurrentProcess();
+        auto procCpu = [&] { ULONG64 c = 0; QueryProcessCycleTime(proc, &c); return uint64_t(c); };
+        // cycles per second of one core: measured once by spinning 50 ms
+        double hz = 0;
+        { ULONG64 c0 = 0, c1 = 0; QueryThreadCycleTime(GetCurrentThread(), &c0); const auto t0 = std::chrono::steady_clock::now();
+          while (std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(50)) YieldProcessor();
+          QueryThreadCycleTime(GetCurrentThread(), &c1); hz = double(c1 - c0) / std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+        uint64_t lastProc = procCpu();
+        auto lastT = std::chrono::steady_clock::now();
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::seconds(10));
+            const auto now = std::chrono::steady_clock::now();
+            const double wall = std::chrono::duration<double>(now - lastT).count() * hz;   // cycles of one core
+            lastT = now;
+            const int n = g_nCpu.load();
+            std::vector<std::pair<double, int>> use;
+            double named = 0;
+            for (int j = 0; j < n; ++j) {
+                const uint64_t t = thread_cycles(g_cpu[j].h), d = t >= g_cpu[j].last ? t - g_cpu[j].last : 0;
+                g_cpu[j].last = t;
+                use.push_back({100.0 * double(d) / wall, j}); named += double(d);
+            }
+            const uint64_t p = procCpu(); const double all = double(p - lastProc); lastProc = p;
+            std::sort(use.begin(), use.end(), [](auto& a, auto& b) { return a.first > b.first; });
+            char line[1024]; int o = std::snprintf(line, sizeof line, "[cpu] %.1f s: process %.0f%% of one core (%u hw threads), others %.0f%%:",
+                                                   g_sinceLaunch(), 100.0 * all / wall, std::thread::hardware_concurrency(), 100.0 * (all - named) / wall);
+            for (auto& [pc, j] : use) { if (pc < 1 || o > 900) break; o += std::snprintf(line + o, sizeof line - o, " %s %.0f", g_cpu[j].name, pc); }
+            std::fprintf(stderr, "%s\n", line);
+        }
+    }).detach();
+}
 void ripprof_register_thread(const char* name) {
+    if (name) cpu_register(name);
     const char* e = std::getenv("RIPPROF");
     if (!e || !name || g_samplerOn.load()) return;
     const char* list = std::getenv("RIPTHREAD") ? std::getenv("RIPTHREAD") : "fifo";

@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/banner_racing_club.png" alt="Racing Club+" width="100%"></p>
 
-<p align="center"><a href="https://www.patreon.com/ilesraider/posts/racing-club-175397772"><b>❤️ Apoya el proyecto y descarga el instalador en Patreon / Support the project and download the installer on Patreon</b></a></p>
+<p align="center"><a href="https://www.patreon.com/ilesraider/posts/racing-club-175397772"><b>❤️ Patreon: el apoyo se destina al mantenimiento del servidor online. Descarga allí el instalador / Patreon support goes to the upkeep of the online server. Download the installer there</b></a></p>
 
 # GTI Club+ para PC (recompilación nativa)
 

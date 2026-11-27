@@ -1,14 +1,15 @@
 @echo off
-rem Racing Club+ : asks for the RPCS3 folder and builds the game from the user's own copy (see LEEME_INSTALADOR.md)
+rem Racing Club+ : asks for the game's .pkg files and builds the game from the user's own copy (see LEEME_INSTALADOR.md)
 setlocal
 cd /d "%~dp0"
 echo ==============================================================
 echo  Racing Club+ para PC - instalador
 echo.
-echo  Necesitas TU copia del juego instalada en RPCS3:
-echo    - version EUROPEA  NPEB00060  con la actualizacion 1.02
+echo  Necesitas los .pkg de TU copia del juego:
+echo    - el juego, version EUROPEA  NPEB00060, con su licencia .rap al lado
+echo    - la actualizacion 1.02
 echo    - (opcional) el pack de coches
-echo    - el firmware de PS3 instalado en RPCS3 (para la musica)
+echo  No hace falta ningun emulador ni el firmware de PS3.
 echo  Otras regiones o versiones NO sirven.
 echo ==============================================================
 echo.
@@ -33,7 +34,10 @@ if errorlevel 1 (
     exit /b 1
   )
 )
-set /p RP=Arrastra aqui la carpeta de RPCS3 y pulsa Intro:
-"%PY%" instalar.py --rpcs3 %RP% --out "%~dp0Racing Club+"
+set /p G=Arrastra aqui el .pkg del JUEGO y pulsa Intro:
+set /p U=Arrastra aqui el .pkg de la ACTUALIZACION 1.02 y pulsa Intro:
+set "D="
+set /p D=Arrastra aqui el .pkg del DLC (o pulsa Intro si no lo tienes):
+"%PY%" instalar.py --pkg %G% %U% %D% --out "%~dp0Racing Club+"
 echo.
 pause

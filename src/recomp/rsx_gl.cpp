@@ -1,27 +1,20 @@
-// RSX -> OpenGL 4.5 renderer (see rsx_gl.h).
-#include "recomp/rsx_gl.h"
+// RSX -> OpenGL 4.5 back end (see rsx_core.h).
+#include "recomp/rsx_core.h"
 #include "recomp/settings.h"
 #include "recomp/lv2.h"
 
-#include <SDL3/SDL.h>
-
 #include <algorithm>
-#include <atomic>
 #include <cmath>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
+#include <deque>
 #include <map>
-#include <set>
 #include <memory>
-#include <mutex>
-#include <string>
+#include <set>
 #include <unordered_map>
-#include <vector>
 #include <immintrin.h>
 
-namespace gti::recomp { bool host_menu_bitmap(const wchar_t* const* lines, int n, int sel, int w, int h, uint32_t* out); void host_restart(); void host_report(const char* gpu); }   // host_win.cpp
 namespace gti::recomp::rsx {
+namespace {
 
 // ------------------------------------------------------------------ OpenGL loader (only what this file uses)
 typedef unsigned int GLenum; typedef unsigned char GLboolean; typedef unsigned int GLbitfield; typedef int GLint;
@@ -78,6 +71,7 @@ enum : GLenum {
     X(void, glBufferData, GLenum, GLsizeiptr, const void*, GLenum) X(void, glBufferSubData, GLenum, GLintptr, GLsizeiptr, const void*) \
     X(void, glBufferStorage, GLenum, GLsizeiptr, const void*, GLbitfield) X(void*, glMapBufferRange, GLenum, GLintptr, GLsizeiptr, GLbitfield) \
     X(GLsync, glFenceSync, GLenum, GLbitfield) X(GLenum, glClientWaitSync, GLsync, GLbitfield, GLuint64) X(void, glDeleteSync, GLsync) X(void, glBindBufferBase, GLenum, GLuint, GLuint) \
+    X(void, glBindBufferRange, GLenum, GLuint, GLuint, GLintptr, GLsizeiptr) \
     X(void, glGenVertexArrays, GLsizei, GLuint*) X(void, glBindVertexArray, GLuint) \
     X(void, glVertexAttribPointer, GLuint, GLint, GLenum, GLboolean, GLsizei, const void*) X(void, glEnableVertexAttribArray, GLuint) \
     X(void, glDisableVertexAttribArray, GLuint) X(void, glVertexAttrib4f, GLuint, GLfloat, GLfloat, GLfloat, GLfloat) \
@@ -87,514 +81,39 @@ enum : GLenum {
     X(void, glProgramBinary, GLuint, GLenum, const void*, GLsizei) X(void, glGetProgramBinary, GLuint, GLsizei, GLsizei*, GLenum*, void*) \
     X(void, glAttachShader, GLuint, GLuint) X(void, glLinkProgram, GLuint) X(void, glGetProgramiv, GLuint, GLenum, GLint*) \
     X(void, glGetProgramInfoLog, GLuint, GLsizei, GLsizei*, GLchar*) X(void, glUseProgram, GLuint) X(GLint, glGetUniformLocation, GLuint, const GLchar*) \
-    X(void, glUniform4fv, GLint, GLsizei, const GLfloat*) X(void, glUniform1i, GLint, GLint) X(void, glDeleteShader, GLuint) X(GLenum, glGetError) X(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*) X(void, glGetIntegerv, GLenum, GLint*) X(GLboolean, glIsEnabled, GLenum)
+    X(void, glUniform4fv, GLint, GLsizei, const GLfloat*) X(void, glUniform1i, GLint, GLint) X(void, glDeleteShader, GLuint) X(GLenum, glGetError) X(void, glReadPixels, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void*) X(void, glGetIntegerv, GLenum, GLint*) X(GLboolean, glIsEnabled, GLenum) \
+    X(void, glGenQueries, GLsizei, GLuint*) X(void, glQueryCounter, GLuint, GLenum) X(void, glGetQueryObjectiv, GLuint, GLenum, GLint*) \
+    X(void, glGetQueryObjectui64v, GLuint, GLenum, uint64_t*) X(void, glGetInteger64v, GLenum, int64_t*)
 #define RSX_DECL(ret, name, ...) typedef ret (*PFN_##name)(__VA_ARGS__); static PFN_##name name = nullptr;
 RSX_GL(RSX_DECL)
 #undef RSX_DECL
 
-static std::mutex g_logMx;
-#define RLOG(...) do { std::lock_guard<std::mutex> lk_(g_logMx); std::fprintf(stderr, __VA_ARGS__); } while (0)
 
-// ------------------------------------------------------------------ state
-static Config C;
-static uint32_t R[0x4000];                     // last value written to every NV4097 method (index = method / 4)
-static uint32_t vpCode[512 * 4];               // transform program memory
-static float vpConst[468 * 4];                 // transform constants
-static bool vpConstDirty = true;
-static uint32_t vpDirtyLo = 0, vpDirtyHi = 468 * 4;   // floats of vpConst changed since the last upload
-static uint32_t vpLoad = 0, cLoad = 0;         // load cursors (in words / constants)
-static uint32_t vpConstWord = 0;
-struct Range { uint32_t first, count; };
-static std::vector<Range> ranges;
-static bool rangesIndexed = false;
-static uint32_t prim = 0;
-struct Display { uint32_t offset = 0, pitch = 0, w = 0, h = 0; } displays[8];
-
-static SDL_Window* win = nullptr;
-static void set_display_mode(int mode);
-static int g_lastFull = 1;   // the full-screen mode F11 goes back to
 static SDL_GLContext glc = nullptr;
-static bool glOk = false, initTried = false;
-static std::atomic<bool> quitFlag{false};
+static bool glOk = false;
 static GLuint vao = 0, vbo = 0, ibo = 0, ubo = 0;
-static uint64_t frameNo = 0, drawsThisFrame = 0;
-static const bool dumpShaders = std::getenv("RSXDUMP") != nullptr;
-static const bool rsxTrace = std::getenv("RSXTRACE") != nullptr;
-
-bool enabled() { static const bool on = !(std::getenv("RSX") && std::getenv("RSX")[0] == '0'); return on; }
-bool quit_requested() { return quitFlag.load(); }
-
-static inline uint32_t be32(uint32_t ea) { uint32_t v; std::memcpy(&v, C.mem + ea, 4); return __builtin_bswap32(v); }
-static inline uint16_t be16(uint32_t ea) { return uint16_t(C.mem[ea] << 8 | C.mem[ea + 1]); }
-static inline float f32(uint32_t bits) { float f; std::memcpy(&f, &bits, 4); return f; }
-static inline float rf(uint32_t m) { return f32(R[m >> 2]); }
-static float half2f(uint16_t h) {
-    const uint32_t sgn = uint32_t(h & 0x8000) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff;
-    uint32_t u;
-    if (e == 0) {
-        if (!m) u = sgn;
-        else { const float v = float(m) * (1.f / 16777216.f); std::memcpy(&u, &v, 4); u |= sgn; }   // subnormal: m * 2^-24
-    } else if (e == 31) u = sgn | 0x7f800000u | (m << 13);
-    else u = sgn | ((e + 112) << 23) | (m << 13);
-    float f; std::memcpy(&f, &u, 4); return f;
-}
-static uint32_t ea_of(uint32_t offset, uint32_t location /*0 local, 1 main*/) { return (location ? C.ioAddr : C.localAddr) + offset; }
-
-static uint64_t g_texUploads = 0, g_texUploadBytes = 0, g_streamBuilds = 0, g_streamVerts = 0, g_progBuilds = 0;   // work counters, see [slowdraw]
-static uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {   // keys used inside this process only
-    const uint8_t* b = static_cast<const uint8_t*>(p);
-    for (; n >= 8; n -= 8, b += 8) { uint64_t w; std::memcpy(&w, b, 8); h = (h ^ w) * 0x9E3779B97F4A7C15ull; h ^= h >> 29; }
-    for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
-    return h;
-}
-
-// ------------------------------------------------------------------ vertex program -> GLSL
-// Instruction layout (4 words) as documented by the nouveau / RPCS3 projects for NV40-class vertex engines.
-struct VpInfo { std::string glsl; uint32_t inputs = 0; uint32_t outputs = 0; int len = 0; bool unsupported = false; };
-
-static const char* swz4(uint32_t x, uint32_t y, uint32_t z, uint32_t w, char* buf) {
-    static const char c[] = "xyzw";
-    buf[0] = '.'; buf[1] = c[x]; buf[2] = c[y]; buf[3] = c[z]; buf[4] = c[w]; buf[5] = 0;
-    return buf;
-}
-static const char* vpOut(uint32_t d) {
-    static const char* n[] = {"o_pos", "v_col0", "v_col1", "v_bfc0", "v_bfc1", "v_fog", "o_psz",
-                              "v_tc[0]", "v_tc[1]", "v_tc[2]", "v_tc[3]", "v_tc[4]", "v_tc[5]", "v_tc[6]", "v_tc[7]", "v_tc[8]", "v_tc[9]"};
-    return d < 17 ? n[d] : "o_dummy";
-}
-
-static VpInfo translate_vp(const uint32_t* code, uint32_t start) {
-    VpInfo vi;
-    std::string b;
-    char t[512], sw[8];
-    for (uint32_t pc = start; pc < 512; ++pc) {
-        const uint32_t* in = code + pc * 4;
-        const uint32_t d0 = in[0], d1 = in[1], d2 = in[2], d3 = in[3];
-        ++vi.len;
-        const uint32_t vecOp = (d1 >> 22) & 0x1f, scaOp = (d1 >> 27) & 0x1f;
-        const uint32_t inputSrc = (d1 >> 8) & 0xf, constSrc = (d1 >> 12) & 0x3ff;
-        const uint32_t src[3] = {((d1 & 0xff) << 9) | (d2 >> 23), (d2 >> 6) & 0x1ffff, ((d2 & 0x3f) << 11) | (d3 >> 21)};
-        const bool absS[3] = {bool((d0 >> 21) & 1), bool((d0 >> 22) & 1), bool((d0 >> 23) & 1)};
-        const bool indexConst = (d3 >> 1) & 1;
-        const uint32_t addrSel = (d0 >> 24) & 1, addrSwz = d0 & 3;
-        auto operand = [&](int i) -> std::string {
-            const uint32_t s = src[i];
-            const uint32_t type = s & 3, tmp = (s >> 2) & 0x3f;
-            std::string r;
-            if (type == 1) { std::snprintf(t, sizeof t, "R[%u]", tmp); r = t; }
-            else if (type == 2) { vi.inputs |= 1u << inputSrc; std::snprintf(t, sizeof t, "in%u", inputSrc); r = t; }
-            else if (type == 3) {
-                if (indexConst) std::snprintf(t, sizeof t, "vc[clamp(%u + A%u.%c, 0, 467)]", constSrc, addrSel, "xyzw"[addrSwz]);
-                else std::snprintf(t, sizeof t, "vc[%u]", constSrc);
-                r = t;
-            } else r = "vec4(0.0)";
-            r += swz4((s >> 14) & 3, (s >> 12) & 3, (s >> 10) & 3, (s >> 8) & 3, sw);
-            if (absS[i]) r = "abs(" + r + ")";
-            if ((s >> 16) & 1) r = "(-" + r + ")";
-            return r;
-        };
-        const std::string a = operand(0), bb = operand(1), c = operand(2);
-        std::string vexpr, sexpr;
-        switch (vecOp) {
-            case 0: break;
-            case 1: vexpr = a; break;
-            case 2: vexpr = a + "*" + bb; break;
-            case 3: vexpr = a + "+" + c; break;
-            case 4: vexpr = a + "*" + bb + "+" + c; break;
-            case 5: vexpr = "vec4(dot((" + a + ").xyz,(" + bb + ").xyz))"; break;
-            case 6: vexpr = "vec4(dot((" + a + ").xyz,(" + bb + ").xyz)+(" + bb + ").w)"; break;
-            case 7: vexpr = "vec4(dot(" + a + "," + bb + "))"; break;
-            case 8: vexpr = "vec4(1.0,(" + a + ").y*(" + bb + ").y,(" + a + ").z,(" + bb + ").w)"; break;
-            case 9: vexpr = "min(" + a + "," + bb + ")"; break;
-            case 10: vexpr = "max(" + a + "," + bb + ")"; break;
-            case 11: vexpr = "vec4(lessThan(" + a + "," + bb + "))"; break;
-            case 12: vexpr = "vec4(greaterThanEqual(" + a + "," + bb + "))"; break;
-            case 13: vexpr = "ARL"; break;
-            case 14: vexpr = "fract(" + a + ")"; break;
-            case 15: vexpr = "floor(" + a + ")"; break;
-            case 16: vexpr = "vec4(equal(" + a + "," + bb + "))"; break;
-            case 17: vexpr = "vec4(0.0)"; break;
-            case 18: vexpr = "vec4(greaterThan(" + a + "," + bb + "))"; break;
-            case 19: vexpr = "vec4(lessThanEqual(" + a + "," + bb + "))"; break;
-            case 20: vexpr = "vec4(notEqual(" + a + "," + bb + "))"; break;
-            case 21: vexpr = "vec4(1.0)"; break;
-            case 22: vexpr = "sign(" + a + ")"; break;
-            case 25: vexpr = "vec4(0.0)"; break;   // TXL (vertex texture fetch): not used by this game so far
-            default: vi.unsupported = true; std::snprintf(t, sizeof t, "  // unsupported vector op %u\n", vecOp); b += t; break;
-        }
-        const std::string s = "(" + c + ").x";
-        switch (scaOp) {
-            case 0: break;
-            case 1: sexpr = "vec4(" + s + ")"; break;
-            case 2: sexpr = "vec4(1.0/" + s + ")"; break;
-            case 3: sexpr = "vec4(rcc(" + s + "))"; break;
-            case 4: sexpr = "vec4(inversesqrt(abs(" + s + ")))"; break;
-            case 5: sexpr = "vexp(" + s + ")"; break;
-            case 6: sexpr = "vlog(" + s + ")"; break;
-            case 7: sexpr = "vlit(" + c + ")"; break;
-            case 13: sexpr = "vec4(log2(abs(" + s + ")))"; break;
-            case 14: sexpr = "vec4(exp2(" + s + "))"; break;
-            case 15: sexpr = "vec4(sin(" + s + "))"; break;
-            case 16: sexpr = "vec4(cos(" + s + "))"; break;
-            default: vi.unsupported = true; std::snprintf(t, sizeof t, "  // unsupported scalar op %u (flow control)\n", scaOp); b += t; break;
-        }
-        // condition (test against a condition register) shared by both units
-        const bool condTest = (d0 >> 13) & 1;
-        const uint32_t cond = (d0 >> 10) & 7;
-        const bool condUpd = ((d0 >> 14) & 1) || ((d0 >> 29) & 1);
-        const uint32_t ccSel = (d0 >> 25) & 1;
-        const uint32_t cswz[4] = {(d0 >> 8) & 3, (d0 >> 6) & 3, (d0 >> 4) & 3, (d0 >> 2) & 3};
-        const bool sat = (d0 >> 26) & 1;
-        const uint32_t dst = (d3 >> 2) & 0x1f, dstTmp = (d0 >> 15) & 0x3f, scaTmp = (d3 >> 7) & 0x3f;
-        const bool vecResult = (d0 >> 30) & 1;
-        const bool vm[4] = {bool((d3 >> 16) & 1), bool((d3 >> 15) & 1), bool((d3 >> 14) & 1), bool((d3 >> 13) & 1)};
-        const bool sm[4] = {bool((d3 >> 20) & 1), bool((d3 >> 19) & 1), bool((d3 >> 18) & 1), bool((d3 >> 17) & 1)};
-        if (dst != 0x1f && dst < 17) vi.outputs |= 1u << dst;
-        auto emit = [&](const std::string& value, const bool* mask, std::vector<std::string> targets) {
-            if (condTest && cond == 0) return;
-            std::string v = sat ? "clamp(" + value + ",0.0,1.0)" : value;
-            b += "  t = " + v + ";\n";
-            if (condUpd) { std::snprintf(t, sizeof t, "  CC%u = t;\n", ccSel); b += t; }   // (writes all components)
-            for (const auto& tg : targets)
-                for (int k = 0; k < 4; ++k) {
-                    if (!mask[k]) continue;
-                    const char comp = "xyzw"[k];
-                    if (condTest && cond != 7) {
-                        static const char* ops[] = {"false", "<", "==", "<=", ">", "!=", ">=", "true"};
-                        std::snprintf(t, sizeof t, "  if (CC%u.%c %s 0.0) %s.%c = t.%c;\n", ccSel, "xyzw"[cswz[k]], ops[cond], tg.c_str(), comp, comp);
-                    } else std::snprintf(t, sizeof t, "  %s.%c = t.%c;\n", tg.c_str(), comp, comp);
-                    b += t;
-                }
-        };
-        if (!vexpr.empty()) {
-            if (vexpr == "ARL") {
-                std::snprintf(t, sizeof t, "  A%u = ivec4(floor(%s));\n", addrSel, a.c_str());
-                b += t;
-            } else {
-                std::vector<std::string> tg;
-                if (dstTmp != 0x3f) { std::snprintf(t, sizeof t, "R[%u]", dstTmp); tg.push_back(t); }
-                if (dst != 0x1f && (vecResult || scaOp == 0)) tg.push_back(vpOut(dst));
-                emit(vexpr, vm, tg);
-            }
-        }
-        if (!sexpr.empty()) {
-            std::vector<std::string> tg;
-            if (scaTmp != 0x3f) { std::snprintf(t, sizeof t, "R[%u]", scaTmp); tg.push_back(t); }
-            else if (dst != 0x1f && (!vecResult || vecOp == 0)) tg.push_back(vpOut(dst));
-            emit(sexpr, sm, tg);
-        }
-        if (d3 & 1) break;   // end of program
-    }
-    std::string h = "#version 450\n"
-                    "layout(std140, binding = 0) uniform VC { vec4 vc[468]; };\n"
-                    "uniform vec4 u_vscale, u_voffset, u_surf;\n";
-    for (int k = 0; k < 16; ++k)
-        if (vi.inputs & (1u << k)) { std::snprintf(t, sizeof t, "layout(location = %d) in vec4 in%d;\n", k, k); h += t; }
-    h += "out vec4 v_col0, v_col1, v_bfc0, v_bfc1, v_fog;\nout vec4 v_tc[10];\n"
-         "float rcc(float x) { float r = 1.0 / x; return sign(r) * clamp(abs(r), 5.42101e-20, 1.884467e19); }\n"
-         "vec4 vexp(float x) { float f = floor(x); return vec4(exp2(f), x - f, exp2(x), 1.0); }\n"
-         "vec4 vlog(float x) { float a = abs(x); float e = floor(log2(a)); return vec4(e, a / exp2(e), log2(a), 1.0); }\n"
-         "vec4 vlit(vec4 s) { float d = max(s.x, 0.0); float sp = s.x > 0.0 ? pow(max(s.y, 0.0), clamp(s.w, -127.9961, 127.9961)) : 0.0; return vec4(1.0, d, sp, 1.0); }\n"
-         "void main() {\n"
-         "  vec4 R[64]; for (int i = 0; i < 64; ++i) R[i] = vec4(0.0);\n"
-         "  vec4 t, CC0 = vec4(0.0), CC1 = vec4(0.0); ivec4 A0 = ivec4(0), A1 = ivec4(0);\n"
-         "  vec4 o_pos = vec4(0.0, 0.0, 0.0, 1.0), o_psz = vec4(1.0), o_dummy;\n"
-         "  v_col0 = vec4(1.0); v_col1 = vec4(0.0); v_bfc0 = vec4(1.0); v_bfc1 = vec4(0.0); v_fog = vec4(0.0);\n"
-         "  for (int i = 0; i < 10; ++i) v_tc[i] = vec4(0.0, 0.0, 0.0, 1.0);\n";
-    // epilogue: the RSX viewport transform (window = ndc * scale + offset, window y down from the top of the
-    // surface) folded into clip space so that GL clipping still works; FBO row 0 = surface memory row 0.
-    if (std::getenv("RSXW1")) b += "  o_pos.w = 1.0;\n";
-    if (std::getenv("RSXVCDBG")) b += "  v_col0 = vc[467]; v_col1 = vc[4];\n";
-    vi.glsl = h + b +
-              "  gl_Position = vec4(o_pos.x * (2.0 * u_vscale.x / u_surf.x) + o_pos.w * (2.0 * u_voffset.x / u_surf.x - 1.0),\n"
-              "                     o_pos.y * (2.0 * u_vscale.y / u_surf.y) + o_pos.w * (2.0 * u_voffset.y / u_surf.y - 1.0),\n"
-              "                     o_pos.z * u_vscale.z + o_pos.w * u_voffset.z, o_pos.w);\n"
-              "  gl_PointSize = o_psz.x;\n" +
-              std::string(std::getenv("RSXVSDBG") && (vi.inputs & 1) ? "  v_col0 = vec4(gl_Position.x * 0.25 + 0.5, gl_Position.y * 0.25 + 0.5, gl_Position.w * 0.25, gl_Position.z * 0.25 + 0.5); gl_Position = vec4(float(gl_VertexID & 1) * 2.0 - 1.0, float(gl_VertexID & 2) - 1.0, 0.5, 1.0);\n" : "") +
-              "}\n";
-    return vi;
-}
-
-// ------------------------------------------------------------------ fragment program -> GLSL
-struct FpInfo { std::string glsl; uint32_t texUsed = 0; uint32_t size = 0; uint32_t nConst = 0; bool unsupported = false; bool writesR0 = false, writesH0 = false; };
-static inline uint32_t fpw(uint32_t ea) { const uint32_t v = be32(ea); return (v << 16) | (v >> 16); }
-
-static uint32_t fp_size(uint32_t ea) {   // bytes up to and including the instruction with the end bit
-    uint32_t o = 0;
-    for (int n = 0; n < 2048; ++n) {
-        const uint32_t dst = fpw(ea + o), s0 = fpw(ea + o + 4), s1 = fpw(ea + o + 8), s2 = fpw(ea + o + 12);
-        o += 16;
-        if (((s0 & 3) == 2) || ((s1 & 3) == 2) || ((s2 & 3) == 2)) o += 16;   // inline constant
-        if (dst & 1) break;
-    }
-    return o;
-}
-
-// walks the program: hashes the instruction words only (the inline constants hold the uniform values the game
-// patches into the microcode) and optionally collects the constants in program order
-static uint64_t fp_walk(uint32_t ea, uint64_t h, std::vector<float>* consts) {
-    uint32_t o = 0;
-    for (int n = 0; n < 2048; ++n) {
-        uint32_t w[4];
-        for (int k = 0; k < 4; ++k) w[k] = fpw(ea + o + 4 * k);
-        h = fnv(w, 16, h);
-        o += 16;
-        if (((w[1] & 3) == 2) || ((w[2] & 3) == 2) || ((w[3] & 3) == 2)) {
-            if (consts) for (int k = 0; k < 4; ++k) consts->push_back(f32(fpw(ea + o + 4 * k)));
-            o += 16;
-        }
-        if (w[0] & 1) break;
-    }
-    return h;
-}
-
-// texDims: 2 bits per sampler: 0 = 2D, 1 = cube, 2 = 3D, 3 = 1D; texUn: unnormalised coordinates
-static FpInfo translate_fp(uint32_t ea, uint32_t texDims, uint32_t control) {
-    FpInfo fi;
-    std::string b;
-    char t[640], sw[8];
-    uint32_t o = 0;
-    std::vector<uint32_t> elseAt, endAt;   // IFE blocks (word offsets)
-    for (int n = 0; n < 2048; ++n) {
-        while (!elseAt.empty() && elseAt.back() == o / 4) { b += "  } else {\n"; elseAt.pop_back(); }
-        while (!endAt.empty() && endAt.back() == o / 4) { b += "  }\n"; endAt.pop_back(); }
-        const uint32_t dst = fpw(ea + o), s0 = fpw(ea + o + 4), s1 = fpw(ea + o + 8), s2 = fpw(ea + o + 12);
-        const bool hasConst = ((s0 & 3) == 2) || ((s1 & 3) == 2) || ((s2 & 3) == 2);
-        const uint32_t constIdx = fi.nConst;
-        if (hasConst) ++fi.nConst;
-        const uint32_t opcode = ((dst >> 24) & 0x3f) | (((s1 >> 31) & 1) << 6);
-        const uint32_t destReg = (dst >> 1) & 0x3f, attr = (dst >> 13) & 0xf, texNum = (dst >> 17) & 0xf;
-        const bool fp16 = (dst >> 7) & 1, setCond = (dst >> 8) & 1, noDest = (dst >> 30) & 1, sat = (dst >> 31) & 1, bx2 = (dst >> 21) & 1;
-        const uint32_t prec = (dst >> 22) & 3;
-        const bool mask[4] = {bool((dst >> 9) & 1), bool((dst >> 10) & 1), bool((dst >> 11) & 1), bool((dst >> 12) & 1)};
-        auto operand = [&](uint32_t s, bool absBit) -> std::string {
-            const uint32_t type = s & 3, idx = (s >> 2) & 0x3f;
-            const bool h = (s >> 8) & 1;
-            std::string r;
-            if (type == 0) { std::snprintf(t, sizeof t, "%s[%u]", h ? "H" : "R", idx); r = t; }
-            else if (type == 1) {
-                static const char* in[] = {"wpos", "v_col0", "v_col1", "v_fog", "v_tc[0]", "v_tc[1]", "v_tc[2]", "v_tc[3]", "v_tc[4]", "v_tc[5]",
-                                           "v_tc[6]", "v_tc[7]", "v_tc[8]", "v_tc[9]", "ssa", "vec4(0.0)"};
-                r = in[attr];
-                if (attr == 1 || attr == 2) r = attr == 1 ? "col0()" : "col1()";
-            } else if (type == 2) {
-                std::snprintf(t, sizeof t, "fc[%u]", constIdx); r = t;
-            }
-            else r = "vec4(0.0)";
-            r += swz4((s >> 9) & 3, (s >> 11) & 3, (s >> 13) & 3, (s >> 15) & 3, sw);
-            if (absBit) r = "abs(" + r + ")";
-            if ((s >> 17) & 1) r = "(-" + r + ")";
-            return r;
-        };
-        const std::string a = operand(s0, (s0 >> 29) & 1), bb = operand(s1, (s1 >> 18) & 1), c = operand(s2, (s2 >> 18) & 1);
-        auto tex = [&](const char* kind) -> std::string {
-            fi.texUsed |= 1u << texNum;
-            const uint32_t dim = (texDims >> (2 * texNum)) & 3;
-            std::string coord = bx2 ? "(" + a + "*2.0-1.0)" : a;
-            std::string r;
-            const std::string smp = "tex" + std::to_string(texNum), sc = "u_tsc[" + std::to_string(texNum) + "]";
-            if (dim == 1) {   // cube
-                if (!std::strcmp(kind, "txl")) r = "textureLod(" + smp + ", (" + coord + ").xyz, (" + coord + ").w)";
-                else r = "texture(" + smp + ", (" + coord + ").xyz)";
-            } else if (dim == 2) r = "texture(" + smp + ", (" + coord + ").xyz)";
-            else if (dim == 3) {   // depth texture with a compare function: 1 where the test passes (2x2 taps)
-                const bool proj = !std::strcmp(kind, "txp");
-                r = "vec4(shcmp(" + smp + ", " + (proj ? "(" + coord + ").xyz / (" + coord + ").w" : "(" + coord + ").xyz") + ", " + sc + ".z))";
-            } else {
-                std::string uv = "(" + coord + ").xy";
-                if (!std::strcmp(kind, "txp")) uv = "((" + coord + ").xy / (" + coord + ").w)";
-                uv = "(" + uv + " * " + sc + ".xy)";
-                if (!std::strcmp(kind, "txl")) r = "textureLod(" + smp + ", " + uv + ", (" + coord + ").w)";
-                else if (!std::strcmp(kind, "txb")) r = "texture(" + smp + ", " + uv + ", (" + coord + ").w)";
-                else if (!std::strcmp(kind, "txd")) r = "textureGrad(" + smp + ", " + uv + ", (" + bb + ").xy, (" + c + ").xy)";
-                else r = "texture(" + smp + ", " + uv + ")";
-            }
-            return r;
-        };
-        std::string e;
-        bool kill = false;
-        switch (opcode) {
-            case 0x00: break;
-            case 0x01: e = a; break;
-            case 0x02: e = a + "*" + bb; break;
-            case 0x03: e = a + "+" + bb; break;
-            case 0x04: e = a + "*" + bb + "+" + c; break;
-            case 0x05: e = "vec4(dot((" + a + ").xyz,(" + bb + ").xyz))"; break;
-            case 0x06: e = "vec4(dot(" + a + "," + bb + "))"; break;
-            case 0x07: e = "vec4(1.0,(" + a + ").y*(" + bb + ").y,(" + a + ").z,(" + bb + ").w)"; break;
-            case 0x08: e = "min(" + a + "," + bb + ")"; break;
-            case 0x09: e = "max(" + a + "," + bb + ")"; break;
-            case 0x0A: e = "vec4(lessThan(" + a + "," + bb + "))"; break;
-            case 0x0B: e = "vec4(greaterThanEqual(" + a + "," + bb + "))"; break;
-            case 0x0C: e = "vec4(lessThanEqual(" + a + "," + bb + "))"; break;
-            case 0x0D: e = "vec4(greaterThan(" + a + "," + bb + "))"; break;
-            case 0x0E: e = "vec4(notEqual(" + a + "," + bb + "))"; break;
-            case 0x0F: e = "vec4(equal(" + a + "," + bb + "))"; break;
-            case 0x10: e = "fract(" + a + ")"; break;
-            case 0x11: e = "floor(" + a + ")"; break;
-            case 0x12: kill = true; break;
-            case 0x13: e = "vec4(uintBitsToFloat(packSnorm4x8(" + a + ")))"; break;
-            case 0x14: e = "unpackSnorm4x8(floatBitsToUint((" + a + ").x))"; break;
-            case 0x15: e = "dFdx(" + a + ")"; break;
-            case 0x16: e = "dFdy(" + a + ")"; break;
-            case 0x17: e = tex("tex"); break;
-            case 0x18: e = tex("txp"); break;
-            case 0x19: e = tex("txd"); break;
-            case 0x1A: e = "vec4(1.0/(" + a + ").x)"; break;
-            case 0x1B: e = "vec4(inversesqrt(abs((" + a + ").x)))"; break;
-            case 0x1C: e = "vec4(exp2((" + a + ").x))"; break;
-            case 0x1D: e = "vec4(log2((" + a + ").x))"; break;
-            case 0x1E: e = "flit(" + a + ")"; break;
-            case 0x1F: e = "mix(" + c + "," + bb + "," + a + ")"; break;
-            case 0x20: e = "vec4(1.0)"; break;
-            case 0x21: e = "vec4(0.0)"; break;
-            case 0x22: e = "vec4(cos((" + a + ").x))"; break;
-            case 0x23: e = "vec4(sin((" + a + ").x))"; break;
-            case 0x24: e = "vec4(uintBitsToFloat(packHalf2x16((" + a + ").xy)))"; break;
-            case 0x25: e = "unpackHalf2x16(floatBitsToUint((" + a + ").x)).xyxy"; break;
-            case 0x26: e = "vec4(pow((" + a + ").x,(" + bb + ").x))"; break;
-            case 0x27: e = "vec4(uintBitsToFloat(packUnorm4x8(" + a + ")))"; break;
-            case 0x28: e = "unpackUnorm4x8(floatBitsToUint((" + a + ").x))"; break;
-            case 0x29: e = "vec4(uintBitsToFloat(packSnorm2x16((" + a + ").xy)))"; break;
-            case 0x2A: e = "unpackSnorm2x16(floatBitsToUint((" + a + ").x)).xyxy"; break;
-            case 0x2C: e = "vec4(uintBitsToFloat(packUnorm4x8(sqrt(" + a + "))))"; break;
-            case 0x2D: e = "pow(unpackUnorm4x8(floatBitsToUint((" + a + ").x)), vec4(2.0))"; break;
-            case 0x2E: e = "vec4(dot((" + a + ").xy,(" + bb + ").xy)+(" + c + ").x)"; break;
-            case 0x2F: e = tex("txl"); break;
-            case 0x31: e = tex("txb"); break;
-            case 0x36: e = "frefl(" + a + "," + bb + ")"; break;
-            case 0x38: e = "vec4(dot((" + a + ").xy,(" + bb + ").xy))"; break;
-            case 0x39: e = "vec4(normalize((" + a + ").xyz), 1.0)"; break;
-            case 0x3A: e = a + "/(" + bb + ").x"; break;
-            case 0x3B: e = a + "*inversesqrt(abs((" + bb + ").x))"; break;
-            case 0x3D: case 0x3E: break;   // FENCT / FENCB
-            case 0x42: {   // IFE: if (condition) ... else ... end
-                const uint32_t elseOff = s1 & 0x7fffffff, endOff = s2 & 0x7fffffff;
-                const uint32_t cs[4] = {(s0 >> 21) & 3, (s0 >> 23) & 3, (s0 >> 25) & 3, (s0 >> 27) & 3};
-                const bool lt = (s0 >> 18) & 1, eq = (s0 >> 19) & 1, gt = (s0 >> 20) & 1;
-                const uint32_t ccr = (s0 >> 31) & 1;
-                std::snprintf(t, sizeof t, "  if (fcond(CC%u.%c%c%c%c, %d, %d, %d)) {\n", ccr, "xyzw"[cs[0]], "xyzw"[cs[1]], "xyzw"[cs[2]], "xyzw"[cs[3]], lt, eq, gt);
-                b += t;
-                if (endOff != elseOff) elseAt.push_back(elseOff);
-                endAt.push_back(endOff);
-                o += 16;
-                if (hasConst) o += 16;
-                if (dst & 1) n = 99999;
-                continue;
-            }
-            default:
-                fi.unsupported = true;
-                std::snprintf(t, sizeof t, "  // unsupported opcode 0x%x\n", opcode);
-                b += t;
-                break;
-        }
-        // execution condition
-        const bool lt = (s0 >> 18) & 1, eq = (s0 >> 19) & 1, gt = (s0 >> 20) & 1;
-        const uint32_t cs[4] = {(s0 >> 21) & 3, (s0 >> 23) & 3, (s0 >> 25) & 3, (s0 >> 27) & 3};
-        const uint32_t ccr = (s0 >> 31) & 1, ccw = (s0 >> 30) & 1;
-        const bool always = lt && eq && gt;
-        auto condOf = [&](int k) -> std::string {
-            std::snprintf(t, sizeof t, "fcond1(CC%u.%c, %d, %d, %d)", ccr, "xyzw"[cs[k]], lt, eq, gt);
-            return t;
-        };
-        if (kill) {
-            if (always) b += "  discard;\n";
-            else b += "  if (" + condOf(0) + " || " + condOf(1) + " || " + condOf(2) + " || " + condOf(3) + ") discard;\n";
-        }
-        if (!e.empty()) {
-            const uint32_t scale = (s1 >> 28) & 7;
-            static const char* scl[] = {"", "*2.0", "*4.0", "*8.0", "", "*0.5", "*0.25", "*0.125"};
-            std::string v = "(" + e + ")" + scl[scale];
-            if (sat) v = "clamp(" + v + ",0.0,1.0)";
-            else if (prec == 2) v = "clamp(" + v + ",-2.0,2.0)";   // fx12
-            else if (prec == 1) v = "clamp(" + v + ",-65504.0,65504.0)";
-            b += "  t = " + v + ";\n";
-            if (setCond) {
-                for (int k = 0; k < 4; ++k)
-                    if (mask[k]) { std::snprintf(t, sizeof t, "  CC%u.%c = t.%c;\n", ccw, "xyzw"[k], "xyzw"[k]); b += t; }
-            }
-            if (!noDest) {
-                std::snprintf(t, sizeof t, "%s[%u]", fp16 ? "H" : "R", destReg);
-                const std::string tg = t;
-                if (destReg == 0) (fp16 ? fi.writesH0 : fi.writesR0) = true;
-                for (int k = 0; k < 4; ++k) {
-                    if (!mask[k]) continue;
-                    const char comp = "xyzw"[k];
-                    if (always) std::snprintf(t, sizeof t, "  %s.%c = t.%c;\n", tg.c_str(), comp, comp);
-                    else std::snprintf(t, sizeof t, "  if (%s) %s.%c = t.%c;\n", condOf(k).c_str(), tg.c_str(), comp, comp);
-                    b += t;
-                }
-            }
-        }
-        o += 16;
-        if (hasConst) o += 16;
-        if (dst & 1) break;
-    }
-    while (!elseAt.empty()) { b += "  } else {\n"; elseAt.pop_back(); }
-    while (!endAt.empty()) { b += "  }\n"; endAt.pop_back(); }
-    fi.size = o;
-    static const bool shDbg = std::getenv("SHDBG") != nullptr;   // debug: shadow-map results as the output colour
-    std::string h = std::string("#version 450\n") + (shDbg ? "#define SHDBG\nfloat g_shS = -1.0; vec2 g_shRD = vec2(0.0);\n" : "") + "#define SHBIAS " + std::string(std::getenv("SHBIAS") ? std::getenv("SHBIAS") : "0.002") + "\n" +
-                    "in vec4 v_col0, v_col1, v_bfc0, v_bfc1, v_fog;\nin vec4 v_tc[10];\n"
-                    "uniform vec4 u_tsc[16];\nuniform vec4 u_alpha;\nuniform vec4 u_wpos;\n" + std::string("uniform vec4 fc[") + std::to_string(std::max(1u, fi.nConst)) + "];\n" +
-                    "layout(location = 0) out vec4 o_c0;\nlayout(location = 1) out vec4 o_c1;\n"
-                    "layout(location = 2) out vec4 o_c2;\nlayout(location = 3) out vec4 o_c3;\n";
-    for (int k = 0; k < 16; ++k) {
-        if (!(fi.texUsed & (1u << k))) continue;
-        const uint32_t dim = (texDims >> (2 * k)) & 3;
-        std::snprintf(t, sizeof t, "layout(binding = %d) uniform %s tex%d;\n", k, dim == 1 ? "samplerCube" : dim == 2 ? "sampler3D" : "sampler2D", k);
-        h += t;
-    }
-    h += "bool fcond1(float c, int lt, int eq, int gt) { return (lt != 0 && c < 0.0) || (eq != 0 && c == 0.0) || (gt != 0 && c > 0.0); }\n"
-         "bool fcond(vec4 c, int lt, int eq, int gt) { return fcond1(c.x, lt, eq, gt) || fcond1(c.y, lt, eq, gt) || fcond1(c.z, lt, eq, gt) || fcond1(c.w, lt, eq, gt); }\n"
-         // depth compare: stored depth OP reference (for GREATER the result is 1 where the surface is NOT behind an
-         // occluder; the game shades with it as "lit"). Checked against the car selection screen, where the cars'
-         // shadows are dark only this way. SHBIAS (default 0.002) moves the reference towards the light: no acne.
-         "float shcmp(sampler2D t, vec3 p, float f) {\n"
-         "  vec4 d = textureGather(t, p.xy, 0); vec4 r = vec4(p.z - SHBIAS); vec4 c;\n"
-         "  if (f < 1.5) c = vec4(lessThan(d, r)); else if (f < 2.5) c = vec4(equal(d, r)); else if (f < 3.5) c = vec4(lessThanEqual(d, r));\n"
-         "  else if (f < 4.5) c = vec4(greaterThan(d, r)); else if (f < 5.5) c = vec4(notEqual(d, r)); else c = vec4(greaterThanEqual(d, r));\n"
-         // bilinear percentage-closer filtering like the hardware: the four results weighted by the position inside
-         // the texel (an even average made the shadow edges blocky). textureGather order: (0,1) (1,1) (1,0) (0,0)
-         "  vec2 fr = fract(p.xy * vec2(textureSize(t, 0)) - 0.5);\n"
-         "  float s = mix(mix(c.w, c.z, fr.x), mix(c.x, c.y, fr.x), fr.y);\n"
-         "#ifdef SHDBG\n  g_shS = s; g_shRD = vec2(p.z, d.w);\n#endif\n"
-         "  return s;\n}\n"
-         "vec4 flit(vec4 s) { float d = max(s.x, 0.0); float sp = s.x > 0.0 ? exp2(s.w * log2(max(s.y, 1e-30))) : 0.0; return vec4(1.0, d, sp, 1.0); }\n"
-         "vec4 frefl(vec4 n, vec4 e) { return vec4(2.0 * dot(n.xyz, e.xyz) / dot(n.xyz, n.xyz) * n.xyz - e.xyz, 0.0); }\n"
-         "vec4 col0() { return gl_FrontFacing ? v_col0 : v_col0; }\n"
-         "vec4 col1() { return v_col1; }\n"
-         "void main() {\n"
-         "  vec4 R[64]; vec4 H[64]; for (int i = 0; i < 64; ++i) { R[i] = vec4(0.0); H[i] = vec4(0.0); }\n"
-         "  vec4 t = vec4(0.0), CC0 = vec4(0.0), CC1 = vec4(0.0);\n"
-         "  vec4 wpos = vec4(gl_FragCoord.x * u_wpos.x, gl_FragCoord.y * u_wpos.y, gl_FragCoord.z, 1.0 / gl_FragCoord.w);\n"
-         "  vec4 ssa = vec4(gl_FrontFacing ? 1.0 : -1.0);\n";
-    const bool out32 = (control & 0x40) != 0;
-    const bool useR = fi.writesR0 && (!fi.writesH0 || out32);
-    std::string tail;
-    if (useR) tail = "  o_c0 = R[0]; o_c1 = R[2]; o_c2 = R[3]; o_c3 = R[4];\n";
-    else tail = "  o_c0 = H[0]; o_c1 = H[4]; o_c2 = H[6]; o_c3 = H[8];\n";
-    if (control & 0xe) tail += "  gl_FragDepth = R[1].z;\n";
-    tail += "  if (u_alpha.x > 0.5) {\n"
-            "    int f = int(u_alpha.y); float a = o_c0.a, r = u_alpha.z; bool pass = true;\n"
-            "    if (f == 0) pass = false; else if (f == 1) pass = a < r; else if (f == 2) pass = a == r; else if (f == 3) pass = a <= r;\n"
-            "    else if (f == 4) pass = a > r; else if (f == 5) pass = a != r; else if (f == 6) pass = a >= r;\n"
-            "    if (!pass) discard;\n  }\n";
-    if (std::getenv("RSXRED")) tail += "  o_c0 = v_col0;\n";
-    if (shDbg) tail += std::getenv("SHDBG")[0] == '2' ? "  if (g_shS >= 0.0) o_c0 = vec4(g_shRD, g_shS, 1.0);\n" : "  if (g_shS >= 0.0) o_c0 = vec4(g_shS, 1.0 - g_shS, 0.0, 1.0);\n";   // red = shadow 1, green = 0
-    fi.glsl = h + b + tail + "}\n";
-    return fi;
-}
+static std::vector<float> vtx;
+static std::vector<uint32_t> idx;
 
 // ------------------------------------------------------------------ programs
-struct Program { uint64_t key = 0; GLuint prog = 0; GLint uVs, uVo, uSurf, uTsc, uAlpha, uWpos, uFc; uint32_t nConst = 0; uint32_t vpInputs = 0; uint32_t texUsed = 0; bool bad = false; };
+// With GL_KHR_parallel_shader_compile the driver links (and finishes cached binaries) on its own threads: a new
+// program is started here and its draws are skipped until GL_COMPLETION_STATUS_KHR says it is done, instead of
+// stalling the frame 5-30 ms per program (first play, or a driver update that emptied the driver's own cache).
+// GLSYNC=1: wait as before.
+struct Program { uint64_t key = 0; GLuint prog = 0; GLint uVs, uVo, uSurf, uTsc, uAlpha, uWpos, uFc; uint32_t nConst = 0; uint32_t vpInputs = 0; uint32_t texUsed = 0; bool bad = false;
+                 bool pending = false; int kind = 0; /* 1 binary from glcache, 2 compiled */ GLuint vsSh = 0, fsSh = 0; std::string vsSrc, fsSrc, cacheName; uint64_t t0 = 0; };
+typedef void (*PFN_glMaxShaderCompilerThreadsKHR)(GLuint);
+static PFN_glMaxShaderCompilerThreadsKHR glMaxShaderCompilerThreadsKHR = nullptr;
+static bool g_parallel = false;
+static uint64_t g_skippedDraws = 0;
 static std::unordered_map<uint64_t, Program> programs;
 
-static GLuint compile(GLenum type, const std::string& src, const char* what) {
+static GLuint compile(GLenum type, const std::string& src, const char* what, bool async = false) {
     const GLuint s = glCreateShader(type);
     const char* p = src.c_str();
     glShaderSource(s, 1, &p, nullptr);
     glCompileShader(s);
+    if (async) return s;   // the link reports errors (checked when it completes)
     GLint ok = 0;
     glGetShaderiv(s, GL_COMPILE_STATUS, &ok);
     if (!ok) {
@@ -605,8 +124,59 @@ static GLuint compile(GLenum type, const std::string& src, const char* what) {
     return s;
 }
 
+// completes a program started by get_program: false while the driver is still working on it (wait = false)
+static bool finish_program(Program& p, bool wait) {
+    if (!wait) { GLint done = 0; glGetProgramiv(p.prog, 0x91B1 /* GL_COMPLETION_STATUS_KHR */, &done); if (!done) return false; }
+    const uint64_t pt1 = SDL_GetPerformanceCounter();
+    GLint ok = 0;
+    glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+    while (glGetError()) {}
+    const bool fromCache = p.kind == 1 && ok;
+    if (!ok && p.kind == 1) {   // the driver rejected the cached binary (other driver version): compile, waiting this once
+        p.vsSh = compile(GL_VERTEX_SHADER, p.vsSrc, "vertex"); p.fsSh = compile(GL_FRAGMENT_SHADER, p.fsSrc, "fragment");
+        glAttachShader(p.prog, p.vsSh); glAttachShader(p.prog, p.fsSh);
+        glLinkProgram(p.prog);
+        glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
+        p.kind = 2;
+    }
+    if (ok && p.kind == 2 && !p.cacheName.empty()) {
+        GLint len = 0;
+        glGetProgramiv(p.prog, 0x8741 /* GL_PROGRAM_BINARY_LENGTH */, &len);
+        if (len > 0) {
+            std::vector<uint8_t> bin(size_t(len) + 4);
+            GLsizei got = 0; GLenum fmt = 0;
+            glGetProgramBinary(p.prog, len, &got, &fmt, bin.data() + 4);
+            const uint32_t f32v = fmt; std::memcpy(bin.data(), &f32v, 4);
+            if (got > 0) if (FILE* f = std::fopen(p.cacheName.c_str(), "wb")) { std::fwrite(bin.data(), 1, size_t(got) + 4, f); std::fclose(f); }
+        }
+    }
+    if (!ok) {
+        char log[4096]; GLsizei ln = 0;
+        glGetProgramInfoLog(p.prog, sizeof log, &ln, log);
+        RLOG("[rsx] link error: %s\n", log);
+        if (p.vsSh) { GLint c = 0; glGetShaderiv(p.vsSh, GL_COMPILE_STATUS, &c); if (!c) { glGetShaderInfoLog(p.vsSh, sizeof log, &ln, log); RLOG("[rsx] vertex shader: %s\n", log); } }
+        if (p.fsSh) { GLint c = 0; glGetShaderiv(p.fsSh, GL_COMPILE_STATUS, &c); if (!c) { glGetShaderInfoLog(p.fsSh, sizeof log, &ln, log); RLOG("[rsx] fragment shader: %s\n", log); } }
+        p.bad = true;
+    }
+    glDeleteShader(p.vsSh); glDeleteShader(p.fsSh); p.vsSh = p.fsSh = 0;
+    p.vsSrc.clear(); p.vsSrc.shrink_to_fit(); p.fsSrc.clear(); p.fsSrc.shrink_to_fit();
+    p.uVs = glGetUniformLocation(p.prog, "u_vscale");
+    p.uVo = glGetUniformLocation(p.prog, "u_voffset");
+    p.uSurf = glGetUniformLocation(p.prog, "u_surf");
+    p.uTsc = glGetUniformLocation(p.prog, "u_tsc");
+    p.uAlpha = glGetUniformLocation(p.prog, "u_alpha");
+    p.uWpos = glGetUniformLocation(p.prog, "u_wpos");
+    p.uFc = glGetUniformLocation(p.prog, "fc");
+    p.pending = false;
+    {   // [prog]: a program that cost the frame time (waiting) or took long to be ready (parallel)
+        const uint64_t now = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
+        const double here = double(now - pt1) * 1000.0 / double(fq), total = double(now - p.t0) * 1000.0 / double(fq);
+        if (wait ? total > 2.0 : here > 2.0) RLOG("[prog] %016llx %.1f ms in this frame (%s)\n", (unsigned long long)p.key, wait ? total : here, fromCache ? "cache" : "compiled");
+        else if (!wait && total > 50.0) RLOG("[prog] %016llx ready %.0f ms after first use (%s, in parallel)\n", (unsigned long long)p.key, total, fromCache ? "cache" : "compiled");
+    }
+    return true;
+}
 static std::vector<float> g_fpConsts;   // constants of the fragment program of the current draw (filled by get_program)
-static uint64_t vpGen = 1;              // bumped whenever vertex program words are uploaded
 static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, uint32_t control) {
     // vertex program words up to the end bit
     uint32_t n = 0;
@@ -635,6 +205,8 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     Program& p = programs[key];
     p.key = key;
     ++g_progBuilds;
+    TickScope progTime(g_progTicks);
+    const uint64_t pt0 = SDL_GetPerformanceCounter();
     const VpInfo vi = translate_vp(vpCode, vpStart);
     const FpInfo fi = translate_fp(fpEa, texDims, control);
     p.vpInputs = vi.inputs;
@@ -655,9 +227,9 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
     if (binCache && !dirMade) { dirMade = true; SDL_CreateDirectory("glcache"); }
     char cacheName[96];
     std::snprintf(cacheName, sizeof cacheName, "glcache/%016llx.bin", (unsigned long long)(fnv(vi.glsl.data(), vi.glsl.size(), fnv(fi.glsl.data(), fi.glsl.size()))));
+    const uint64_t pt1 = SDL_GetPerformanceCounter();
     p.prog = glCreateProgram();
-    GLint ok = 0;
-    GLuint vs = 0, fs = 0;
+    p.vsSrc = vi.glsl; p.fsSrc = fi.glsl; p.cacheName = binCache ? cacheName : ""; p.t0 = pt0;
     if (binCache)
         if (FILE* f = std::fopen(cacheName, "rb")) {
             std::vector<uint8_t> bin;
@@ -667,42 +239,20 @@ static Program* get_program(uint32_t vpStart, uint32_t fpEa, uint32_t texDims, u
             if (bin.size() > 4) {
                 uint32_t fmt; std::memcpy(&fmt, bin.data(), 4);
                 glProgramBinary(p.prog, fmt, bin.data() + 4, GLsizei(bin.size() - 4));
-                glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
                 while (glGetError()) {}
+                p.kind = 1;
             }
         }
-    if (!ok) {
-        vs = compile(GL_VERTEX_SHADER, vi.glsl, "vertex"); fs = compile(GL_FRAGMENT_SHADER, fi.glsl, "fragment");
-        glAttachShader(p.prog, vs);
-        glAttachShader(p.prog, fs);
+    if (!p.kind) {
+        p.vsSh = compile(GL_VERTEX_SHADER, vi.glsl, "vertex", g_parallel); p.fsSh = compile(GL_FRAGMENT_SHADER, fi.glsl, "fragment", g_parallel);
+        glAttachShader(p.prog, p.vsSh);
+        glAttachShader(p.prog, p.fsSh);
         glLinkProgram(p.prog);
-        glGetProgramiv(p.prog, GL_LINK_STATUS, &ok);
-        if (ok && binCache) {
-            GLint len = 0;
-            glGetProgramiv(p.prog, 0x8741 /* GL_PROGRAM_BINARY_LENGTH */, &len);
-            if (len > 0) {
-                std::vector<uint8_t> bin(size_t(len) + 4);
-                GLsizei got = 0; GLenum fmt = 0;
-                glGetProgramBinary(p.prog, len, &got, &fmt, bin.data() + 4);
-                const uint32_t f32v = fmt; std::memcpy(bin.data(), &f32v, 4);
-                if (got > 0) if (FILE* f = std::fopen(cacheName, "wb")) { std::fwrite(bin.data(), 1, size_t(got) + 4, f); std::fclose(f); }
-            }
-        }
+        p.kind = 2;
     }
-    if (!ok) {
-        char log[4096]; GLsizei ln = 0;
-        glGetProgramInfoLog(p.prog, sizeof log, &ln, log);
-        RLOG("[rsx] link error: %s\n", log);
-        p.bad = true;
-    }
-    glDeleteShader(vs); glDeleteShader(fs);
-    p.uVs = glGetUniformLocation(p.prog, "u_vscale");
-    p.uVo = glGetUniformLocation(p.prog, "u_voffset");
-    p.uSurf = glGetUniformLocation(p.prog, "u_surf");
-    p.uTsc = glGetUniformLocation(p.prog, "u_tsc");
-    p.uAlpha = glGetUniformLocation(p.prog, "u_alpha");
-    p.uWpos = glGetUniformLocation(p.prog, "u_wpos");
-    p.uFc = glGetUniformLocation(p.prog, "fc");
+    p.pending = true;
+    (void)pt1;
+    if (!g_parallel) finish_program(p, true);
     static int nProg = 0;
     if (++nProg % 50 == 0) RLOG("[rsx] %d programs compiled\n", nProg);
     return &p;
@@ -873,15 +423,6 @@ static void clear_surface(uint32_t mask) {
 struct Tex { GLuint id = 0; uint64_t sig = 0; uint64_t lastUse = 0; GLenum target = GL_TEXTURE_2D; uint64_t regSig = 0, checked = ~0ull, sampler = ~0ull; };
 static std::unordered_map<uint64_t, Tex> texCache;
 
-static uint32_t swizzle_index(uint32_t x, uint32_t y, uint32_t lw, uint32_t lh) {   // Morton order, x in the low bit
-    uint32_t r = 0, bit = 0;
-    for (uint32_t k = 0; k < 16 && (k < lw || k < lh); ++k) {
-        if (k < lw) r |= ((x >> k) & 1) << bit++;
-        if (k < lh) r |= ((y >> k) & 1) << bit++;
-    }
-    return r;
-}
-static uint32_t ilog2(uint32_t v) { uint32_t r = 0; while ((1u << r) < v) ++r; return r; }
 
 struct TexFmt { GLenum ifmt, fmt, type; uint32_t bpp; bool dxt; uint32_t blockBytes; int swap; };   // swap: 0 none, 2 u16, 4 u32
 static bool tex_format(uint32_t f, TexFmt& o) {
@@ -910,17 +451,6 @@ static GLenum wrap_of(uint32_t w) {
                  case 5: return GL_CLAMP_TO_EDGE; case 6: case 8: return GL_MIRROR_CLAMP_TO_EDGE; default: return GL_CLAMP_TO_EDGE; }
 }
 
-// uploads (or finds) texture unit i; returns dimension code for the shader key and the coordinate scale
-static uint32_t texDimsOf(int i) {
-    const uint32_t base = i < 8 ? 0x1a00 + 0x20 * i : 0x1b00 + 0x20 * (i - 8);
-    const uint32_t fmtReg = R[(base + 4) >> 2];
-    const uint32_t dim = (fmtReg >> 4) & 0xf;
-    if (fmtReg & 4) return 1;
-    if (dim == 3) return 2;
-    const uint32_t f = (fmtReg >> 8) & 0x9f;   // DEPTH24_D8 / DEPTH24_D8_FLOAT / DEPTH16 / DEPTH16_FLOAT
-    if (f >= 0x90 && f <= 0x93 && ((R[(base + 8) >> 2] >> 28) & 7) != 7 && ((R[(base + 8) >> 2] >> 28) & 7) != 0) return 3;   // shadow map: depth compare
-    return 0;
-}
 
 // NV4097_SET_TEXTURE_BORDER_COLOR (A8R8G8B8): what CLAMP_TO_BORDER samples outside the texture, e.g. the white
 // around a projected shadow that multiplies the road
@@ -1082,7 +612,7 @@ static void bind_texture_impl(int i, float* tsc) {
     const uint64_t key = (uint64_t(loc) << 32 | off) ^ (uint64_t(cube) << 63);
     Tex& tx = texCache[key];
     g_bindMemoOk = true;
-    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull;
+    const uint64_t regSig = fnv(&fmtReg, 4) ^ (uint64_t(rect) << 20) ^ (uint64_t(pitch) << 3) ^ remap * 0x100000001b3ull ^ uint64_t(texture_epoch()) * 0x9E3779B97F4A7C15ull;
     uint64_t sig = tx.sig;
     // The content is re-sampled every 4th frame only (and whenever the registers change): textures are rarely
     // rewritten in place (render targets are handled apart), and this sampling was a third of the RSX thread.
@@ -1101,6 +631,7 @@ static void bind_texture_impl(int i, float* tsc) {
         tx.sig = sig;
         tx.sampler = ~0ull;
         ++g_texUploads; g_texUploadBytes += total;
+        TickScope texTime(g_texTicks);
         glBindTexture(target, tx.id);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
@@ -1194,90 +725,6 @@ static void bind_texture_impl(int i, float* tsc) {
     if (std::getenv("ANISOLOG")) { static int n = 0; if (n++ < 12) RLOG("[aniso] texture %ux%u, %u levels, filter %08x, game %ux -> %ux%c", w, h, mips, filt, 1u << gameAniso, 1u << an, 10); }
 }
 
-// ------------------------------------------------------------------ vertex data and draws
-static std::vector<float> vtx;
-static std::vector<uint32_t> idx;
-
-// byte-swaps n big-endian 32-bit words (the float vertex arrays: Edge writes ~20 million positions a second)
-__attribute__((target("avx2"))) static void bswap32_block(uint32_t* dst, const uint8_t* src, size_t n) {
-    const __m256i sh = _mm256_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12, 3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), _mm256_shuffle_epi8(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(src + 4 * i)), sh));
-    for (; i < n; ++i) { uint32_t w; std::memcpy(&w, src + 4 * i, 4); dst[i] = __builtin_bswap32(w); }
-}
-// 16-bit big-endian indices + base -> 32-bit (every index of every draw goes through here)
-__attribute__((target("avx2"))) static void gather_i16(uint32_t* d, const uint8_t* q, uint32_t n, uint32_t add) {
-    const __m128i sh = _mm_setr_epi8(1, 0, 3, 2, 5, 4, 7, 6, 9, 8, 11, 10, 13, 12, 15, 14);
-    const __m256i va = _mm256_set1_epi32(int(add));
-    uint32_t k = 0;
-    for (; k + 8 <= n; k += 8)
-        _mm256_storeu_si256(reinterpret_cast<__m256i*>(d + k), _mm256_add_epi32(_mm256_cvtepu16_epi32(_mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i*>(q + 2 * k)), sh)), va));
-    for (; k < n; ++k) { uint16_t w; std::memcpy(&w, q + 2 * size_t(k), 2); d[k] = uint32_t(__builtin_bswap16(w)) + add; }
-}
-// lowest index and highest index + 1 (the restart value 0xffffffff wraps to 0 and drops out of the maximum)
-__attribute__((target("avx2"))) static void index_range(const uint32_t* v, size_t n, uint32_t& lo, uint32_t& hi1) {
-    __m256i mn = _mm256_set1_epi32(-1), mx = _mm256_setzero_si256();
-    const __m256i one = _mm256_set1_epi32(1);
-    size_t i = 0;
-    for (; i + 8 <= n; i += 8) {
-        const __m256i x = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v + i));
-        mn = _mm256_min_epu32(mn, x); mx = _mm256_max_epu32(mx, _mm256_add_epi32(x, one));
-    }
-    alignas(32) uint32_t a[8], b[8];
-    _mm256_store_si256(reinterpret_cast<__m256i*>(a), mn); _mm256_store_si256(reinterpret_cast<__m256i*>(b), mx);
-    lo = 0xffffffffu; hi1 = 0;
-    for (int k = 0; k < 8; ++k) { lo = std::min(lo, a[k]); hi1 = std::max(hi1, b[k]); }
-    for (; i < n; ++i) { lo = std::min(lo, v[i]); hi1 = std::max(hi1, v[i] + 1); }
-}
-// Number of floats per vertex convert_attr writes for attribute a: float arrays keep their own size (byte swap only,
-// the missing components come from GL's defaults 0, 0, 1), everything else is expanded to 4.
-static uint32_t attr_comps(int a) {
-    const uint32_t fmt = R[(0x1740 + 4 * a) >> 2];
-    const uint32_t size = std::min<uint32_t>((fmt >> 4) & 0xf, 4);
-    static const bool off = std::getenv("RSXCOMPS4") != nullptr;   // RSXCOMPS4=1: old path (everything as 4 floats), for A/B checks
-    return !off && (fmt & 0xf) == 2 && ((fmt >> 8) & 0xff) && size ? size : 4;
-}
-static void convert_attr(int a, uint32_t first, uint32_t count, float* out, uint32_t comps = 4) {
-    const uint32_t fmt = R[(0x1740 + 4 * a) >> 2], offReg = R[(0x1680 + 4 * a) >> 2];
-    const uint32_t type = fmt & 0xf, size = std::min<uint32_t>((fmt >> 4) & 0xf, 4), stride = (fmt >> 8) & 0xff;
-    const uint32_t base = ea_of(offReg & 0x7fffffff, offReg >> 31) + R[0x1738 >> 2];
-    const uint8_t* p = C.mem + base + size_t(stride) * first;
-    if (type == 2 && comps == size && stride) {   // packed floats: byte swap only
-        uint32_t* o = reinterpret_cast<uint32_t*>(out);
-        if (stride == 4 * size) bswap32_block(o, p, size_t(count) * size);
-        else for (uint32_t v = 0; v < count; ++v, p += stride, o += size) bswap32_block(o, p, size);
-        return;
-    }
-    // one tight loop per type (this runs for every vertex of every draw); missing components are 0, 0, 0, 1
-    const auto r16 = [](const uint8_t* q) { uint16_t v; std::memcpy(&v, q, 2); return uint16_t(__builtin_bswap16(v)); };
-    const auto r32 = [](const uint8_t* q) { uint32_t v; std::memcpy(&v, q, 4); return __builtin_bswap32(v); };
-#define RSX_CONV(EXPR)     for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {         out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 1;         for (uint32_t k = 0; k < size; ++k) out[k] = (EXPR);     }
-    switch (type) {
-        case 1: RSX_CONV(std::max(-1.f, int16_t(r16(p + 2 * k)) / 32767.f)) break;
-        case 2:
-            if (size == 3) for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) { const uint32_t x[4] = {r32(p), r32(p + 4), r32(p + 8), 0x3f800000u}; std::memcpy(out, x, 16); }
-            else if (size == 4) for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) { const uint32_t x[4] = {r32(p), r32(p + 4), r32(p + 8), r32(p + 12)}; std::memcpy(out, x, 16); }
-            else if (size == 2) for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) { const uint32_t x[4] = {r32(p), r32(p + 4), 0u, 0x3f800000u}; std::memcpy(out, x, 16); }
-            else RSX_CONV(f32(r32(p + 4 * k)))
-            break;
-        case 3: RSX_CONV(half2f(r16(p + 2 * k))) break;
-        case 4: RSX_CONV(p[k] * (1.f / 255.f)) break;
-        case 5: RSX_CONV(float(int16_t(r16(p + 2 * k)))) break;
-        case 6:
-            for (uint32_t v = 0; v < count; ++v, p += stride, out += 4) {
-                const uint32_t w = r32(p);
-                out[0] = float(int32_t(w << 21) >> 21) / 1023.f;
-                out[1] = float(int32_t(w << 10) >> 21) / 1023.f;
-                out[2] = float(int32_t(w) >> 22) / 511.f;
-                out[3] = 1;
-            }
-            break;
-        case 7: RSX_CONV(float(p[k])) break;
-        default: for (uint32_t v = 0; v < count; ++v, out += 4) { out[0] = 0; out[1] = 0; out[2] = 0; out[3] = 1; } break;
-    }
-#undef RSX_CONV
-}
-
 static GLenum gl_prim(uint32_t p) {
     switch (p) { case 1: return GL_POINTS; case 2: return GL_LINES; case 3: return GL_LINE_LOOP; case 4: return GL_LINE_STRIP; case 5: return GL_TRIANGLES;
                  case 6: case 9: return GL_TRIANGLE_STRIP; case 7: case 10: return GL_TRIANGLE_FAN; case 8: return GL_TRIANGLES; default: return GL_TRIANGLES; }
@@ -1323,8 +770,36 @@ static void apply_state() {
 // change from frame to frame: they are converted to floats once and kept in a GL buffer. Edge geometry output
 // (positions, in main memory) is new every frame and goes through the per-draw path. The content of a cached
 // stream is sampled once per frame, so a level change that reuses the address is noticed.
-struct Stream { GLuint vbo = 0; uint32_t count = 0; uint64_t sig = 0, checked = ~0ull; };
+struct Stream { GLuint vbo = 0; size_t offset = 0; uint32_t count = 0; uint64_t sig = 0, checked = ~0ull; };
 static std::unordered_map<uint64_t, Stream> streams;
+// The streams live in a few big GL buffers (64 MB each, filled front to back): a buffer of its own per stream cost
+// ~25 us of driver time each, and a scene change builds 1000-2000 of them (40 ms in one frame). A stream that has to
+// grow or changed content gets new room; the space it leaves is reclaimed when the arena is full (everything is
+// dropped and rebuilt, once per few scene changes). RSXNOARENA=1: one buffer per stream as before.
+static constexpr size_t kArenaChunk = size_t(64) << 20, kArenaMaxChunks = 12;
+static std::vector<GLuint> arenaBufs;
+static size_t arenaChunk = 0, arenaHead = 0;
+static bool arena_alloc(size_t bytes, GLuint& buf, size_t& off) {
+    if (bytes > kArenaChunk) return false;
+    if (arenaBufs.empty() || arenaHead + bytes > kArenaChunk) {
+        if (!arenaBufs.empty()) ++arenaChunk;
+        arenaHead = 0;
+        if (arenaChunk >= kArenaMaxChunks) {   // full: start over (the streams are rebuilt as draws ask for them)
+            for (auto& [k, st] : streams) st.vbo = 0, st.count = 0;
+            arenaChunk = 0;
+            RLOG("[rsx] vertex stream arena full: rebuilt\n");
+        }
+        while (arenaBufs.size() <= arenaChunk) {
+            GLuint b = 0; glGenBuffers(1, &b); glBindBuffer(GL_ARRAY_BUFFER, b);
+            if (glBufferStorage) glBufferStorage(GL_ARRAY_BUFFER, GLsizeiptr(kArenaChunk), nullptr, 0x0100 /* GL_DYNAMIC_STORAGE_BIT */);
+            else glBufferData(GL_ARRAY_BUFFER, GLsizeiptr(kArenaChunk), nullptr, 0x88E4 /* GL_STATIC_DRAW */);
+            arenaBufs.push_back(b);
+        }
+    }
+    buf = arenaBufs[arenaChunk]; off = arenaHead;
+    arenaHead += (bytes + 255) & ~size_t(255);
+    return true;
+}
 static uint64_t stream_sig(const uint8_t* p, uint32_t stride, uint32_t count) {
     uint64_t h = fnv(&count, 4);
     const uint32_t step = std::max<uint32_t>(1, count / 24);
@@ -1332,7 +807,7 @@ static uint64_t stream_sig(const uint8_t* p, uint32_t stride, uint32_t count) {
     return fnv(p + size_t(count - 1) * stride, std::min<uint32_t>(stride, 8), h);
 }
 // GL buffer with attribute a converted for vertices 0..need-1 (4 floats each), or 0 when the stream is not cacheable
-static GLuint cached_stream(int a, uint32_t need) {
+static GLuint cached_stream(int a, uint32_t need, size_t& offset) {
     static const bool off = std::getenv("RSXNOSTREAMCACHE") != nullptr;
     const uint32_t fmt = R[(0x1740 + 4 * a) >> 2], offReg = R[(0x1680 + 4 * a) >> 2];
     const uint32_t stride = (fmt >> 8) & 0xff;
@@ -1349,13 +824,24 @@ static GLuint cached_stream(int a, uint32_t need) {
         static std::vector<float> tmp;
         const uint32_t n = need + need / 4 + 64;   // room to grow: other draws of the object use later vertices
         tmp.resize(size_t(n) * 4);
-        convert_attr(a, 0, n, tmp.data());
-        if (!st.vbo) glGenBuffers(1, &st.vbo);
-        glBindBuffer(GL_ARRAY_BUFFER, st.vbo);
-        glBufferData(GL_ARRAY_BUFFER, tmp.size() * 4, tmp.data(), 0x88E4 /* GL_STATIC_DRAW */);
+        { TickScope t(g_convTicks); convert_attr(a, 0, n, tmp.data()); }
+        TickScope bt(g_bufTicks);
+        static const bool noArena = std::getenv("RSXNOARENA") != nullptr;
+        GLuint ab = 0; size_t ao = 0;
+        if (!noArena && arena_alloc(tmp.size() * 4, ab, ao)) {
+            st.vbo = ab; st.offset = ao;   // (an arena reset clears entries but keeps them: st stays valid)
+            glBindBuffer(GL_ARRAY_BUFFER, ab);
+            glBufferSubData(GL_ARRAY_BUFFER, GLintptr(ao), GLsizeiptr(tmp.size() * 4), tmp.data());
+        } else {
+            if (!st.vbo || !noArena) { glGenBuffers(1, &st.vbo); }   // (a stream too big for the arena: its own buffer)
+            st.offset = 0;
+            glBindBuffer(GL_ARRAY_BUFFER, st.vbo);
+            glBufferData(GL_ARRAY_BUFFER, tmp.size() * 4, tmp.data(), 0x88E4 /* GL_STATIC_DRAW */);
+        }
         st.count = n; st.sig = stream_sig(p, stride, n); st.checked = frameNo;
         ++g_streamBuilds; g_streamVerts += n;
     }
+    offset = st.offset;
     return st.vbo;
 }
 
@@ -1367,6 +853,7 @@ static GLuint ringBuf = 0;
 static uint8_t* ringPtr = nullptr;
 static constexpr size_t kRingSeg = size_t(16) << 20, kRingSegs = 4;
 static size_t ringHead = 0, ringSegNo = 0;
+static uint64_t ringSegSerial = 0;   // +1 every segment change: data older than 3 changes may be overwritten
 static GLsync ringFence[kRingSegs] = {};
 static void ring_init() {
     if (std::getenv("RSXNORING") || !glBufferStorage || !glMapBufferRange || !glFenceSync) return;
@@ -1383,7 +870,7 @@ static uint8_t* ring_alloc(size_t bytes, size_t align, size_t& off) {
     size_t h = (ringHead + align - 1) & ~(align - 1);
     if (h + bytes > (ringSegNo + 1) * kRingSeg) {   // next segment: fence this one, wait until the GPU is done with the next
         ringFence[ringSegNo] = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
-        ringSegNo = (ringSegNo + 1) % kRingSegs;
+        ringSegNo = (ringSegNo + 1) % kRingSegs; ++ringSegSerial;
         if (ringFence[ringSegNo]) { const uint64_t tw = SDL_GetPerformanceCounter(); glClientWaitSync(ringFence[ringSegNo], GL_SYNC_FLUSH_COMMANDS_BIT, 1000000000ull); glDeleteSync(ringFence[ringSegNo]); ringFence[ringSegNo] = nullptr; ++pfRingWaits; pfRingWaitT += SDL_GetPerformanceCounter() - tw; }
         h = ringSegNo * kRingSeg;
     }
@@ -1398,18 +885,25 @@ static uint64_t pfSub[4];   // RSXPROF: attribute setup, index copy, draw call, 
 static const char* const pfName[6] = {"target+program", "state+uniforms", "textures", "indices", "vertex conversion", "upload+draw"};
 static void do_draw() {
     if (ranges.empty() || !glOk) return;
-    struct SlowDraw {   // a draw over 6 ms: what it had to build
-        uint64_t t0 = SDL_GetPerformanceCounter(), tu = g_texUploads, tb = g_texUploadBytes, sb = g_streamBuilds, sv = g_streamVerts, pb = g_progBuilds;
+    uint64_t stT[6] = {};   // this draw's time per stage (pfName), for [slowdraw]
+    struct SlowDraw {   // a draw over 6 ms: what it had to build and which stage took the time
+        const uint64_t* st;
+        uint64_t t0 = SDL_GetPerformanceCounter(), tu = g_texUploads, tb = g_texUploadBytes, sb = g_streamBuilds, sv = g_streamVerts, pb = g_progBuilds, rw = pfRingWaitT;
+        explicit SlowDraw(const uint64_t* s) : st(s) {}
         ~SlowDraw() {
-            const double ms = (SDL_GetPerformanceCounter() - t0) * 1000.0 / SDL_GetPerformanceFrequency();
-            if (ms > 6) RLOG("[slowdraw] %.0f ms: %llu textures uploaded (%llu KB), %llu vertex streams built (%llu vertices), %llu programs built\n", ms, (unsigned long long)(g_texUploads - tu),
-                             (unsigned long long)((g_texUploadBytes - tb) >> 10), (unsigned long long)(g_streamBuilds - sb), (unsigned long long)(g_streamVerts - sv), (unsigned long long)(g_progBuilds - pb));
+            const uint64_t dt = SDL_GetPerformanceCounter() - t0;
+            g_drawTicks += dt; ++g_drawCount;
+            const double k = 1000.0 / SDL_GetPerformanceFrequency(), ms = dt * k;
+            if (ms > 6) RLOG("[slowdraw] %.0f ms: %llu textures uploaded (%llu KB), %llu vertex streams built (%llu vertices), %llu programs built; "
+                             "program %.1f, state+constants %.1f, textures %.1f, indices %.1f, vertices %.1f, draw %.1f ms (ring wait %.1f)\n", ms, (unsigned long long)(g_texUploads - tu),
+                             (unsigned long long)((g_texUploadBytes - tb) >> 10), (unsigned long long)(g_streamBuilds - sb), (unsigned long long)(g_streamVerts - sv), (unsigned long long)(g_progBuilds - pb),
+                             st[0] * k, st[1] * k, st[2] * k, st[3] * k, st[4] * k, st[5] * k, (pfRingWaitT - rw) * k);
         }
-    } slowDraw;
+    } slowDraw(stT);
     static const bool prof = std::getenv("RSXPROF") != nullptr;
-    uint64_t pt = prof ? SDL_GetPerformanceCounter() : 0;
+    uint64_t pt = SDL_GetPerformanceCounter();
     int stage = 0;
-    auto mark = [&] { if (prof) { const uint64_t n = SDL_GetPerformanceCounter(); pfT[stage++] += n - pt; pt = n; } };
+    auto mark = [&] { const uint64_t n = SDL_GetPerformanceCounter(); if (stage < 6) { stT[stage] = n - pt; if (prof) pfT[stage] += n - pt; ++stage; } pt = n; };
     ++drawsThisFrame;
     {   // RSXSKIP=a-b: skip draws a..b of every frame (debug bisection)
         static long s0 = -1, s1 = -1;
@@ -1425,19 +919,56 @@ static void do_draw() {
     uint32_t texDims = 0;
     for (int i = 0; i < 16; ++i) texDims |= texDimsOf(i) << (2 * i);
     Program* p = get_program(R[0x1ea0 >> 2] & 511, fpEa, texDims, R[0x1d60 >> 2]);
-    if (!p || p->bad) return;
+    if (!p) return;
+// Only draws into the full-screen image may be skipped while their shaders are being built (it is drawn again
+// next frame); a draw into anything else (paint layers composed once when a race loads, shadow maps, cube faces)
+// waits: skipped, it would leave that texture wrong for good (the player's car came out black).
+    if (p->pending && !finish_program(*p, !(cur.logW == 1280 && cur.logH == 720))) { ++g_skippedDraws; return; }
+    if (p->bad) return;
     mark();
     glUseProgram(p->prog);
     apply_state();
     // vertex program constants
-    if (vpConstDirty) {   // only the constants written since the last draw (usually a matrix or two of the 468 registers)
+    // Default: a full copy of the constants goes into the persistent ring and is bound by range, so the driver
+    // never has to update a buffer the GPU may still be reading (glBufferSubData on a busy UBO stalls the AMD
+    // OpenGL driver until the GPU catches up). Only on AMD: on NVIDIA rebinding the range per draw costs ~2 us of
+    // driver time per draw (measured 3.2 -> 6.5 us/draw), while its glBufferSubData does not stall.
+    // RSXUBORING=1 / RSXUBOSUB=1 force the ring / the old path (dirty range into one UBO).
+    static const bool uboSub = [] {
+        if (!glBindBufferRange || std::getenv("RSXUBOSUB")) return true;
+        if (std::getenv("RSXUBORING")) return false;
+        const char* v = reinterpret_cast<const char*>(glGetString(0x1F00 /* GL_VENDOR */));
+        const char* r = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
+        const bool amd = (v && (std::strstr(v, "ATI") || std::strstr(v, "AMD"))) || (r && (std::strstr(r, "AMD") || std::strstr(r, "Radeon")));
+        RLOG("[rsx] vertex constants: %s\n", amd ? "copied into the persistent ring (AMD)" : "updated in one buffer");
+        return !amd;
+    }();
+    static GLint uboAlign = 0;
+    static uint64_t uboSerial = ~0ull;   // ring segment serial when the bound copy was made
+    static bool uboInRing = false;
+    bool uboDone = false;
+    if (!uboSub && ringPtr) {
+        if (!uboAlign) { glGetIntegerv(0x8A34 /* GL_UNIFORM_BUFFER_OFFSET_ALIGNMENT */, &uboAlign); if (uboAlign <= 0) uboAlign = 256; }
+        if (uboInRing && !vpConstDirty && ringSegSerial - uboSerial < kRingSegs - 1) uboDone = true;   // bound copy still valid
+        else {
+            size_t uOff = 0;
+            if (uint8_t* up = ring_alloc(sizeof vpConst, size_t(uboAlign), uOff)) {
+                std::memcpy(up, vpConst, sizeof vpConst);
+                glBindBufferRange(GL_UNIFORM_BUFFER, 0, ringBuf, GLintptr(uOff), GLsizeiptr(sizeof vpConst));
+                uboSerial = ringSegSerial; uboInRing = true; uboDone = true;
+                vpConstDirty = false; vpDirtyLo = 468 * 4; vpDirtyHi = 0;
+            }
+        }
+    }
+    if (!uboDone && uboInRing) { uboInRing = false; vpConstDirty = true; vpDirtyLo = 0; vpDirtyHi = 468 * 4; }   // back to the UBO: refresh it whole
+    if (!uboDone && vpConstDirty) {   // only the constants written since the last draw (usually a matrix or two of the 468 registers)
         static bool allocated = false;
         glBindBuffer(GL_UNIFORM_BUFFER, ubo);
         if (!allocated) { glBufferData(GL_UNIFORM_BUFFER, sizeof vpConst, vpConst, GL_DYNAMIC_DRAW); allocated = true; }
         else glBufferSubData(GL_UNIFORM_BUFFER, GLintptr(vpDirtyLo) * 4, GLsizeiptr(vpDirtyHi - vpDirtyLo) * 4, vpConst + vpDirtyLo);
         vpConstDirty = false; vpDirtyLo = 468 * 4; vpDirtyHi = 0;
     }
-    glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
+    if (!uboDone) glBindBufferBase(GL_UNIFORM_BUFFER, 0, ubo);
     float vs[4] = {rf(0xa30), rf(0xa34), rf(0xa38), rf(0xa3c)}, vo[4] = {rf(0xa20), rf(0xa24), rf(0xa28), rf(0xa2c)};
     glUniform4fv(p->uVs, 1, vs);
     glUniform4fv(p->uVo, 1, vo);
@@ -1543,12 +1074,12 @@ static void do_draw() {
             glVertexAttrib4f(a, rf(0x1c00 + 16 * a), rf(0x1c04 + 16 * a), rf(0x1c08 + 16 * a), rf(0x1c0c + 16 * a));
         }
     }
-    GLuint streamVbo[16] = {};
+    GLuint streamVbo[16] = {}; size_t streamOff[16] = {};
     // where in vtx each attribute converted for this draw starts (in floats; -1 = cached stream), and its floats per vertex
     long slot[16]; uint32_t comps[16]; size_t vtxFloats = 0;
     for (int k = 0; k < na; ++k) {
         comps[k] = 4;
-        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1)) != 0) { slot[k] = -1; continue; }
+        if (!sparse && (streamVbo[k] = cached_stream(attrs[k], vmax + 1, streamOff[k])) != 0) { slot[k] = -1; continue; }
         const uint32_t fmt = R[(0x1740 + 4 * attrs[k]) >> 2];
         comps[k] = ((fmt >> 8) & 0xff) ? attr_comps(attrs[k]) : 4;
         slot[k] = long(vtxFloats);
@@ -1610,7 +1141,7 @@ static void do_draw() {
         glEnableVertexAttribArray(attrs[k]);
         if (streamVbo[k]) {   // cached stream: holds every vertex from 0, the indices are relative to vmin
             glBindBuffer(GL_ARRAY_BUFFER, streamVbo[k]);
-            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(size_t(vmin) * 16));
+            glVertexAttribPointer(attrs[k], 4, GL_FLOAT, 0, 16, reinterpret_cast<const void*>(streamOff[k] + size_t(vmin) * 16));
             glBindBuffer(GL_ARRAY_BUFFER, vBuf);
         } else
             glVertexAttribPointer(attrs[k], GLint(comps[k]), GL_FLOAT, 0, GLsizei(4 * comps[k]), reinterpret_cast<const void*>(vOff + size_t(slot[k]) * 4));
@@ -1687,6 +1218,9 @@ static void do_draw() {
                  vp[0], vp[1], vp[2], vp[3], cmk[0], cmk[1], cmk[2], cmk[3], dfb, fb, glIsEnabled(GL_DEPTH_TEST), glIsEnabled(GL_STENCIL_TEST), glIsEnabled(GL_CULL_FACE), glIsEnabled(GL_BLEND), glIsEnabled(0x8C89));
             RLOG("[draw]   center pixel after draw: %u %u %u %u, GL error %x, stencil %u depthbounds %x\n", px[0], px[1], px[2], px[3], glGetError(), R[0x328 >> 2], R[0x380 >> 2]);
         }
+        for (int a = 0; a < 16; ++a) if ((p->vpInputs & (1u << a)) && !((R[(0x1740 + 4 * a) >> 2] >> 4) & 0xf))
+            RLOG("[draw]   const attr %d: %g %g %g %g\n", a, rf(0x1c00 + 16 * a), rf(0x1c04 + 16 * a), rf(0x1c08 + 16 * a), rf(0x1c0c + 16 * a));
+        if (!g_fpConsts.empty()) RLOG("[draw]   fc0 %g %g %g %g (%zu consts) vpInputs %x\n", g_fpConsts[0], g_fpConsts[1], g_fpConsts[2], g_fpConsts[3], g_fpConsts.size() / 4, p->vpInputs);
         RLOG("[draw]   scissor %08x %08x viewport %08x %08x clip %08x %08x window %08x ctl %08x\n", R[0x8c0 >> 2], R[0x8c4 >> 2], R[0xa00 >> 2], R[0xa04 >> 2], R[0x200 >> 2], R[0x204 >> 2], R[0x1d88 >> 2], R[0x1d60 >> 2]);
         for (uint32_t v = 0; v < nv && v < 6; ++v) RLOG("[draw]   v%u: %g %g %g %g | %g %g\n", v, vtx[v * 4], vtx[v * 4 + 1], vtx[v * 4 + 2], vtx[v * 4 + 3], na > 2 ? vtx[(2 * nv + v) * 4] : 0.f, na > 2 ? vtx[(2 * nv + v) * 4 + 1] : 0.f);
         RLOG("[draw]   vc467 %g %g %g %g vc4 %g %g %g %g vscale %g %g %g voff %g %g %g\n", vpConst[467 * 4], vpConst[467 * 4 + 1], vpConst[467 * 4 + 2], vpConst[467 * 4 + 3],
@@ -1699,228 +1233,6 @@ static void do_draw() {
         }
     }
     for (int k = 0; k < na; ++k) glDisableVertexAttribArray(attrs[k]);
-}
-
-// ------------------------------------------------------------------ window
-static void init_gl() {
-    initTried = true;
-    if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) { RLOG("[rsx] SDL_Init failed: %s\n", SDL_GetError()); return; }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    win = SDL_CreateWindow("Racing Club+ (F1: opciones)", 1280, 720, SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE);
-    if (!win) { RLOG("[rsx] window: %s\n", SDL_GetError()); return; }
-    glc = SDL_GL_CreateContext(win);
-    if (!glc) { RLOG("[rsx] GL context: %s\n", SDL_GetError()); return; }
-    SDL_GL_SetSwapInterval(settings().vsync);
-    if (settings().fullscreen) set_display_mode(settings().fullscreen);
-#define RSX_LOAD(ret, name, ...) name = reinterpret_cast<PFN_##name>(SDL_GL_GetProcAddress(#name)); if (!name) { RLOG("[rsx] missing GL function %s\n", #name); return; }
-    RSX_GL(RSX_LOAD)
-#undef RSX_LOAD
-    RLOG("[rsx] OpenGL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
-    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
-    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
-    glGenBuffers(1, &vbo); glGenBuffers(1, &ibo); glGenBuffers(1, &ubo);
-    ring_init();
-    glEnable(0x8D69 /* GL_PRIMITIVE_RESTART_FIXED_INDEX */);
-    glEnable(GL_PROGRAM_POINT_SIZE);
-    if (std::getenv("RSXCLAMP")) glEnable(GL_DEPTH_CLAMP);
-    if (dumpShaders) SDL_CreateDirectory("rsxdump");
-    glOk = true;
-}
-
-// Display mode: 0 window, 1 borderless window covering the monitor, 2 full screen.
-// Full screen (SDL's desktop full screen) lets the NVIDIA OpenGL driver show the image directly ("independent flip"):
-// lowest latency, but the desktop compositor never sees it, so screen capture (OBS) records black. The borderless
-// mode covers the monitor plus one row, which keeps the window composed: it looks the same and can be captured.
-static void set_display_mode(int mode) {
-    static int sx = 0, sy = 0, sw = 1280, sh = 720;
-    static int cur = 0;
-    if (cur == 0 && mode != 0) { SDL_GetWindowPosition(win, &sx, &sy); SDL_GetWindowSize(win, &sw, &sh); }
-    if (cur == 2) SDL_SetWindowFullscreen(win, false);
-    if (cur != 0) { SDL_SetWindowBordered(win, true); SDL_SetWindowSize(win, sw, sh); SDL_SetWindowPosition(win, sx, sy); }
-    if (mode == 1) {
-        SDL_Rect r{};
-        if (SDL_GetDisplayBounds(SDL_GetDisplayForWindow(win), &r)) {
-            SDL_SetWindowBordered(win, false);
-            SDL_SetWindowPosition(win, r.x, r.y);
-            SDL_SetWindowSize(win, r.w, r.h + 1);
-        }
-    } else if (mode == 2) {
-        SDL_SetWindowFullscreen(win, true);
-    }
-    if (mode != 0) SDL_RaiseWindow(win);
-    if (mode != 0 && std::getenv("FSTOP")) SDL_SetWindowAlwaysOnTop(win, true);   // debug: tests started from a background process
-    cur = mode;
-}
-// ------------------------------------------------------------------ options menu (F1)
-static bool menuOpen = std::getenv("MENUTEST") != nullptr, menuDirty = true;   // MENUTEST=1 (debug): open from the start
-static int menuSel = 1;
-static const int kMenuLines = 18, kMenuFirst = 1, kMenuLast = 15;   // title, 12 options, "apply" (restarts the game), problem report, "quit", 2 notes
-static void menu_change(int dir) {
-    Settings& s = settings();
-    switch (menuSel) {
-        case 1: s.fullscreen = (s.fullscreen + (dir ? dir : 1) + 3) % 3; if (s.fullscreen) g_lastFull = s.fullscreen; set_display_mode(s.fullscreen); break;
-        case 2: s.scale = std::clamp(s.scale + dir, 1, 3); break;
-        case 3: { static const int r[4] = {60, 72, 120, 144}; int i = 0; while (i < 3 && r[i] != s.gameHz) ++i; s.gameHz = r[(i + dir + 4) % 4]; break; }
-        case 4: s.refresh ^= 1; break;
-        case 5: s.language = 1 + (s.language - 1 + dir + 5) % 5; break;
-        case 6: s.showFps ^= 1; if (!s.showFps) SDL_SetWindowTitle(win, "Racing Club+"); break;
-        case 7: s.vsync ^= 1; SDL_GL_SetSwapInterval(s.vsync); break;
-        case 8: s.sound ^= 1; break;
-        case 9: s.aniso = std::clamp(s.aniso + (dir ? dir : 1), 0, 4); ++g_texGen; break;
-        case 10: s.streaming ^= 1; break;
-        case 11: s.fxaa ^= 1; break;
-        case 13: if (dir >= 0) { settings_save(); host_restart(); } break;
-        case 14: if (dir >= 0) { settings_save(); host_report(reinterpret_cast<const char*>(glGetString(0x1F01 /* GL_RENDERER */))); } break;
-        case 15: if (dir >= 0) { settings_save(); SDL_Event q{}; q.type = SDL_EVENT_QUIT; SDL_PushEvent(&q); } break;   // same as closing the window   // the options marked * are read once at start
-        case 12: s.sharpen = (s.sharpen + (dir ? dir : 1) + 4) % 4; break;   // the texture cache keeps sampler state: rebuild it
-    }
-    menuDirty = true;
-}
-static void draw_menu(int ww, int wh) {
-    static GLuint tex = 0, fbo = 0;
-    const int W = 880, H = 800;
-    if (!tex) {
-        glGenTextures(1, &tex); glGenFramebuffers(1, &fbo);
-        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        menuDirty = true;
-    }
-    if (menuDirty) {
-        menuDirty = false;
-        const Settings& s = settings();
-        static const wchar_t* const res[3] = {L"1280 x 720 (original)", L"2560 x 1440", L"3840 x 2160"};
-        static const wchar_t* const lang[5] = {L"English", L"Français", L"Español", L"Deutsch", L"Italiano"};
-        wchar_t l[kMenuLines][96];
-        std::swprintf(l[0], 96, L"OPCIONES");
-        std::swprintf(l[1], 96, L"Modo de pantalla\t‹ %ls ›", s.fullscreen == 0 ? L"Ventana" : s.fullscreen == 1 ? L"Ventana sin bordes" : L"Pantalla completa");
-        std::swprintf(l[2], 96, L"Resolución interna\t‹ %ls ›", res[std::clamp(s.scale, 1, 3) - 1]);
-        std::swprintf(l[3], 96, L"Imágenes por segundo *\t‹ %ls ›", s.gameHz == 60 ? L"60 (original)" : s.gameHz == 72 ? L"72 (ideal en 144 Hz)" : s.gameHz == 120 ? L"120 (experimental)" : L"144 (experimental)");
-        std::swprintf(l[4], 96, L"Adaptar la pantalla al juego *\t‹ %ls ›", s.refresh ? L"Sí" : L"No");
-        std::swprintf(l[5], 96, L"Idioma del juego *\t‹ %ls ›", lang[std::clamp(s.language, 1, 5) - 1]);
-        std::swprintf(l[6], 96, L"Contador de FPS en el título\t‹ %ls ›", s.showFps ? L"Sí" : L"No");
-        std::swprintf(l[7], 96, L"V-Sync\t‹ %ls ›", s.vsync ? L"Sí" : L"No");
-        std::swprintf(l[8], 96, L"Sonido *\t‹ %ls ›", s.sound ? L"Sí" : L"No");
-        {
-            static const wchar_t* const an[5] = {L"No", L"2x", L"4x", L"8x", L"16x"};
-            std::swprintf(l[9], 96, L"Filtrado anisótropo\t‹ %ls ›", an[std::clamp(s.aniso, 0, 4)]);
-        }
-        std::swprintf(l[10], 96, L"Modo directo (60 para OBS/Twitch) *\t‹ %ls ›", s.streaming ? L"Sí" : L"No");
-        std::swprintf(l[11], 96, L"Antialiasing (FXAA)\t‹ %ls ›", s.fxaa ? L"Sí" : L"No");
-        {
-            static const wchar_t* const sh[4] = {L"No", L"Baja", L"Media", L"Alta"};
-            std::swprintf(l[12], 96, L"Nitidez\t‹ %ls ›", sh[std::clamp(s.sharpen, 0, 3)]);
-        }
-        std::swprintf(l[13], 96, L"Aplicar cambios\t‹ Reiniciar el juego ›");
-        std::swprintf(l[14], 96, L"Informe de problemas\t‹ Crear y abrir GitHub ›");
-        std::swprintf(l[15], 96, L"Salir del juego\t‹ Salir ›");
-        std::swprintf(l[16], 96, L"* se aplica al reiniciar el juego (Aplicar cambios + Intro)");
-        std::swprintf(l[17], 96, L"Teclado: flechas, Intro, F1 o Esc   ·   Mando: panel táctil o botón PS, cruceta, cruz, círculo");
-        const wchar_t* lines[kMenuLines];
-        for (int i = 0; i < kMenuLines; ++i) lines[i] = l[i];
-        static std::vector<uint32_t> px;
-        px.resize(size_t(W) * H);
-        if (!host_menu_bitmap(lines, kMenuLines, menuSel, W, H, px.data())) return;
-        glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 4);
-        glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, W, H, 0, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, px.data());
-    }
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo);
-    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
-    const int dh = std::min(wh * 7 / 10, H * 2), dw = dh * W / H, dx = (ww - dw) / 2, dy = (wh - dh) / 2;
-    glBlitFramebuffer(0, 0, W, H, dx, dy + dh, dx + dw, dy, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-}
-
-static SDL_Gamepad* pad = nullptr;
-static bool padHold = false;   // the menu was closed with the controller: the game sees no buttons until they are released
-static void pump_events() {
-    SDL_Event e;
-    while (SDL_PollEvent(&e)) {
-        if (e.type == SDL_EVENT_QUIT) quitFlag = true;
-        if (e.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(e.gdevice.which);
-        if (e.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {   // the menu with the controller: touchpad click or PS button opens and closes it
-            const int b = e.gbutton.button;
-            if (b == SDL_GAMEPAD_BUTTON_TOUCHPAD || b == SDL_GAMEPAD_BUTTON_GUIDE || (menuOpen && b == SDL_GAMEPAD_BUTTON_EAST)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) { settings_save(); padHold = true; } }
-            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
-            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }
-            else if (menuOpen && b == SDL_GAMEPAD_BUTTON_DPAD_LEFT) menu_change(-1);
-            else if (menuOpen && (b == SDL_GAMEPAD_BUTTON_DPAD_RIGHT || b == SDL_GAMEPAD_BUTTON_SOUTH)) menu_change(1);
-        }
-        if (e.type == SDL_EVENT_KEY_DOWN && !e.key.repeat) {
-            const SDL_Scancode sc = e.key.scancode;
-            if (sc == SDL_SCANCODE_F11 || (sc == SDL_SCANCODE_RETURN && (e.key.mod & SDL_KMOD_ALT))) { Settings& st = settings(); if (st.fullscreen) { g_lastFull = st.fullscreen; st.fullscreen = 0; } else st.fullscreen = g_lastFull; set_display_mode(st.fullscreen); menuDirty = true; settings_save(); }
-            else if (sc == SDL_SCANCODE_F1 || (menuOpen && sc == SDL_SCANCODE_ESCAPE)) { menuOpen = !menuOpen; menuDirty = true; if (!menuOpen) settings_save(); }
-            else if (menuOpen && sc == SDL_SCANCODE_UP) { menuSel = menuSel > kMenuFirst ? menuSel - 1 : kMenuLast; menuDirty = true; }
-            else if (menuOpen && sc == SDL_SCANCODE_DOWN) { menuSel = menuSel < kMenuLast ? menuSel + 1 : kMenuFirst; menuDirty = true; }
-            else if (menuOpen && sc == SDL_SCANCODE_LEFT) menu_change(-1);
-            else if (menuOpen && (sc == SDL_SCANCODE_RIGHT || sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_SPACE)) menu_change(1);
-        }
-    }
-    {   // vibration the game asks for (cellPadSetActDirect), renewed while it lasts
-        static uint32_t last = 0; static uint64_t renewed = 0;
-        const uint32_t rb = menuOpen || std::getenv("NORUMBLE") ? 0 : lv2_rumble();
-        const uint64_t now = SDL_GetTicks();
-        if (pad && (rb != last || (rb && now - renewed > 150))) {
-            const uint16_t low = uint16_t((rb & 0xff) * 257), high = (rb >> 8) ? 0xffff : 0;
-            SDL_RumbleGamepad(pad, low, high, rb ? 300 : 0);
-            last = rb; renewed = now;
-        }
-    }
-    if (menuOpen) { lv2_set_pad(PadState{}); return; }   // the game sees no input while the menu is open
-    if (padHold) {
-        if (pad && (SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_EAST) || SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_SOUTH))) { lv2_set_pad(PadState{}); return; }
-        padHold = false;
-    }
-    // input -> DualShock 3 state
-    PadState s;
-    const bool* k = SDL_GetKeyboardState(nullptr);
-    auto btn = [&](SDL_GamepadButton b) { return pad && SDL_GetGamepadButton(pad, b); };
-    auto axis = [&](SDL_GamepadAxis a) { return pad ? SDL_GetGamepadAxis(pad, a) / 32768.f : 0.f; };
-    if (k[SDL_SCANCODE_RETURN] || btn(SDL_GAMEPAD_BUTTON_START)) s.digital1 |= 0x08;
-    if (k[SDL_SCANCODE_BACKSPACE] || btn(SDL_GAMEPAD_BUTTON_BACK)) s.digital1 |= 0x01;
-    if (k[SDL_SCANCODE_UP] || btn(SDL_GAMEPAD_BUTTON_DPAD_UP)) s.digital1 |= 0x10;
-    if (k[SDL_SCANCODE_RIGHT] || btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) s.digital1 |= 0x20;
-    if (k[SDL_SCANCODE_DOWN] || btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) s.digital1 |= 0x40;
-    if (k[SDL_SCANCODE_LEFT] || btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) s.digital1 |= 0x80;
-    const float lt = std::max(axis(SDL_GAMEPAD_AXIS_LEFT_TRIGGER), k[SDL_SCANCODE_S] ? 1.f : 0.f);
-    const float rt = std::max(axis(SDL_GAMEPAD_AXIS_RIGHT_TRIGGER), k[SDL_SCANCODE_W] ? 1.f : 0.f);
-    if (lt > 0.1f) s.digital2 |= 0x01;
-    if (rt > 0.1f) s.digital2 |= 0x02;
-    if (k[SDL_SCANCODE_Q] || btn(SDL_GAMEPAD_BUTTON_LEFT_SHOULDER)) s.digital2 |= 0x04;
-    if (k[SDL_SCANCODE_E] || btn(SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER)) s.digital2 |= 0x08;
-    if (k[SDL_SCANCODE_V] || btn(SDL_GAMEPAD_BUTTON_NORTH)) s.digital2 |= 0x10;
-    if (k[SDL_SCANCODE_ESCAPE] || btn(SDL_GAMEPAD_BUTTON_EAST)) s.digital2 |= 0x20;
-    if (k[SDL_SCANCODE_X] || k[SDL_SCANCODE_SPACE] || btn(SDL_GAMEPAD_BUTTON_SOUTH)) s.digital2 |= 0x40;
-    if (k[SDL_SCANCODE_C] || btn(SDL_GAMEPAD_BUTTON_WEST)) s.digital2 |= 0x80;
-    if (k[SDL_SCANCODE_L] || btn(SDL_GAMEPAD_BUTTON_LEFT_STICK)) s.digital1 |= 0x02;    // L3: headlights
-    if (k[SDL_SCANCODE_H] || btn(SDL_GAMEPAD_BUTTON_RIGHT_STICK)) s.digital1 |= 0x04;   // R3: horn
-    float lx = axis(SDL_GAMEPAD_AXIS_LEFTX), ly = axis(SDL_GAMEPAD_AXIS_LEFTY);
-    if (k[SDL_SCANCODE_A]) lx = -1; if (k[SDL_SCANCODE_D]) lx = 1;
-    auto a8 = [](float v) { return uint16_t(std::clamp(int(128 + v * 127.5f), 0, 255)); };
-    s.analog[0] = a8(axis(SDL_GAMEPAD_AXIS_RIGHTX)); s.analog[1] = a8(axis(SDL_GAMEPAD_AXIS_RIGHTY));
-    s.analog[2] = a8(lx); s.analog[3] = a8(ly);
-    // pressure order: right, left, up, down, triangle, circle, cross, square, L1, R1, L2, R2
-    auto pr = [](bool b) { return uint16_t(b ? 255 : 0); };
-    s.pressure[0] = pr(s.digital1 & 0x20); s.pressure[1] = pr(s.digital1 & 0x80); s.pressure[2] = pr(s.digital1 & 0x10); s.pressure[3] = pr(s.digital1 & 0x40);
-    s.pressure[4] = pr(s.digital2 & 0x10); s.pressure[5] = pr(s.digital2 & 0x20); s.pressure[6] = pr(s.digital2 & 0x40); s.pressure[7] = pr(s.digital2 & 0x80);
-    s.pressure[8] = pr(s.digital2 & 0x04); s.pressure[9] = pr(s.digital2 & 0x08);
-    s.pressure[10] = uint16_t(std::clamp(lt, 0.f, 1.f) * 255); s.pressure[11] = uint16_t(std::clamp(rt, 0.f, 1.f) * 255);
-    static bool any = false;
-    if (s.digital1 || s.digital2 || std::abs(lx) > 0.2f || std::abs(ly) > 0.2f) any = true;
-    if (any) lv2_set_pad(s);   // the scripted test input stays active until the user touches something
-}
-
-void init(const Config& cfg) { C = cfg; }
-
-void set_display_buffer(uint32_t id, uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h) {
-    if (id < 8) displays[id] = Display{offset, pitch, w, h};
-    RLOG("[rsx] display buffer %u: offset 0x%x pitch %u %ux%u\n", id, offset, pitch, w, h);
 }
 
 // ------------------------------------------------------------------ final image: antialiasing and sharpening
@@ -2035,33 +1347,80 @@ static bool post_present(GLuint src, int sw, int sh, int dx, int dy, int dw, int
     return true;
 }
 
-void flip(uint32_t id) {
-    if (!enabled()) return;
-    if (!initTried) init_gl();
-    if (!glOk) return;
-    ++frameNo;
+
+// ------------------------------------------------------------------ device
+static bool init_gl() {
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 5);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    glc = SDL_GL_CreateContext(win);
+    if (!glc) { RLOG("[rsx] GL context: %s\n", SDL_GetError()); return false; }
+    SDL_GL_SetSwapInterval(settings().vsync);
+#define RSX_LOAD(ret, name, ...) name = reinterpret_cast<PFN_##name>(SDL_GL_GetProcAddress(#name)); if (!name) { RLOG("[rsx] missing GL function %s\n", #name); return false; }
+    RSX_GL(RSX_LOAD)
+#undef RSX_LOAD
+    RLOG("[rsx] OpenGL %s on %s\n", glGetString(GL_VERSION), glGetString(GL_RENDERER));
+    glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE);
+    glGenVertexArrays(1, &vao); glBindVertexArray(vao);
+    glGenBuffers(1, &vbo); glGenBuffers(1, &ibo); glGenBuffers(1, &ubo);
+    ring_init();
+    glEnable(0x8D69 /* GL_PRIMITIVE_RESTART_FIXED_INDEX */);
+    glEnable(GL_PROGRAM_POINT_SIZE);
+    if (std::getenv("RSXCLAMP")) glEnable(GL_DEPTH_CLAMP);
+    if (dumpShaders) SDL_CreateDirectory("rsxdump");
+    glMaxShaderCompilerThreadsKHR = reinterpret_cast<PFN_glMaxShaderCompilerThreadsKHR>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsKHR"));
+    if (!glMaxShaderCompilerThreadsKHR) glMaxShaderCompilerThreadsKHR = reinterpret_cast<PFN_glMaxShaderCompilerThreadsKHR>(SDL_GL_GetProcAddress("glMaxShaderCompilerThreadsARB"));
+    g_parallel = glMaxShaderCompilerThreadsKHR && !std::getenv("GLSYNC");
+    if (g_parallel) glMaxShaderCompilerThreadsKHR(0xFFFFFFFFu);
+    RLOG("[rsx] shader programs: %s\n", g_parallel ? "built in parallel by the driver (draws wait for them)" : "built when first used");
+    glOk = true;
+    return true;
+}
+
+// ------------------------------------------------------------------ overlays (menu, notifications)
+static const char* const kOverlayFs =
+    "#version 450 core\n"
+    "layout(binding = 15) uniform sampler2D src;\n"
+    "in vec2 uv;\n"
+    "out vec4 o;\n"
+    "void main() { o = texture(src, vec2(uv.x, 1.0 - uv.y)); }\n";   // bitmap row 0 is its top
+// a bitmap (premultiplied BGRA) over the window image, blended by its alpha
+static void draw_overlay(int k, const Overlay& o, int wh) {
+    static GLuint tex[2] = {}, prog = 0, ovao = 0;
+    static bool tried = false;
+    if (!o.px) return;
+    if (!tried) { tried = true; prog = post_program(kOverlayFs); glGenVertexArrays(1, &ovao); }
+    if (!prog) return;
+    glActiveTexture(GL_TEXTURE0 + 15); ++g_texGen;
+    if (!tex[k]) {
+        glGenTextures(1, &tex[k]);
+        glBindTexture(GL_TEXTURE_2D, tex[k]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    }
+    glBindTexture(GL_TEXTURE_2D, tex[k]);
+    if (o.changed) {
+        glPixelStorei(0x0CF5 /* GL_UNPACK_ALIGNMENT */, 4);
+        glTexImage2D(GL_TEXTURE_2D, 0, 0x8058 /* GL_RGBA8 */, o.w, o.h, 0, 0x80E1 /* GL_BGRA */, GL_UNSIGNED_BYTE, o.px);
+    }
     stateValid = false;
-    {   // FPSCAP=from,to,ms: sleep ms per frame between those seconds (debug: tells per-frame from per-second clocks)
-        static double a = -1, b = -1, ms = 0;
-        static bool parsed = false;
-        if (!parsed) { parsed = true; if (const char* e = std::getenv("FPSCAP")) std::sscanf(e, "%lf,%lf,%lf", &a, &b, &ms); }
-        const double t = SDL_GetTicks() / 1000.0;
-        if (ms > 0 && t >= a && t < b) SDL_Delay(Uint32(ms));
-    }
-    {   // frame pacing: longest gap between two flips, reported every 2 s (a hitch shows here, not in the average)
-        static uint64_t lastFlip = 0, worst = 0, since = 0; static int over = 0;
-        const uint64_t t = SDL_GetPerformanceCounter(), fq = SDL_GetPerformanceFrequency();
-        if (lastFlip) { const uint64_t d = t - lastFlip; worst = std::max(worst, d); if (d * 1000 > fq * 25) ++over; }
-        if (lastFlip && (t - lastFlip) * 1000 > fq * 60) RLOG("[hitch] %.0f ms without a flip, ending %.2f s after launch\n", (t - lastFlip) * 1000.0 / fq, SDL_GetTicks() / 1000.0);
-        lastFlip = t;
-        if (t - since > 2 * fq) {
-            if (since) RLOG("[pace] worst frame %.0f ms, %d frames over 25 ms\n", worst * 1000.0 / fq, over);
-            since = t; worst = 0; over = 0;
-        }
-    }
-    const Display& d = displays[id & 7];
-    int ww = 1280, wh = 720;
-    SDL_GetWindowSizeInPixels(win, &ww, &wh);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_CULL_FACE); glDisable(GL_SCISSOR_TEST);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(1, 0x303, 1, 0x303);   // ONE, ONE_MINUS_SRC_ALPHA
+    glBlendEquationSeparate(0x8006, 0x8006);
+    glViewport(o.dx, wh - o.dy - o.dh, o.dw, o.dh);
+    glBindVertexArray(ovao);
+    glUseProgram(prog);
+    glDrawArrays(GL_TRIANGLES, 0, 3);
+    glDisable(GL_BLEND);
+    glBindVertexArray(vao);
+}
+
+// ------------------------------------------------------------------ present
+static void present_gl(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl) {
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
     glDisable(GL_SCISSOR_TEST);
     for (int k = 0; k < 4; ++k) glColorMaski(k, 1, 1, 1, 1);
@@ -2149,105 +1508,71 @@ void flip(uint32_t id) {
         glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     } else {
         static int warned = 0;
-        if (warned++ < 5) RLOG("[rsx] flip %u: display buffer at 0x%x was never rendered\n", id, d.offset);
+        if (warned++ < 5) RLOG("[rsx] flip: display buffer at 0x%x was never rendered\n", d.offset);
     }
-    if (menuOpen) draw_menu(ww, wh);
+    for (int k = 0; k < nOvl && k < 2; ++k) draw_overlay(k, ovl[k], wh);
     {   // SWAPLOG=1: how long presenting takes (it blocks when the compositor or the driver throttles)
         static const bool swapLog = std::getenv("SWAPLOG") != nullptr;
-        const uint64_t ts = swapLog ? SDL_GetTicksNS() : 0;
+        const uint64_t ts = SDL_GetTicksNS();
         SDL_GL_SwapWindow(win);
+        g_swapUs += (SDL_GetTicksNS() - ts) / 1000;
+        // [gpu]: when the GPU really finished each image, measured from the flip (GPU timestamp after the swap).
+        // Past one refresh the image cannot be shown at the next refresh: the display repeats the previous one (a
+        // visible skip) although the game produced every image on time.
+        static const bool gpuTime = !(std::getenv("GPUTIME") && std::getenv("GPUTIME")[0] == '0');   // on by default (problem reports); GPUTIME=0 off
+        if (gpuTime && glQueryCounter && glGetQueryObjectui64v && glGetInteger64v) {
+            struct Q { GLuint id; uint64_t cpuNs; };
+            static std::deque<Q> pending; static std::vector<GLuint> freeQ;
+            static int64_t offNs = 0; static uint64_t calibAt = 0;
+            static uint64_t n = 0, over = 0, worst = 0, sum = 0, lastLog = 0;
+            const uint64_t nowNs = SDL_GetTicksNS();
+            if (!calibAt || nowNs - calibAt > 1000000000ull) {   // GPU clock -> CPU clock
+                int64_t g = 0; glGetInteger64v(0x8E28 /* GL_TIMESTAMP */, &g);
+                offNs = int64_t(SDL_GetTicksNS()) - g; calibAt = nowNs;
+            }
+            GLuint q;
+            if (freeQ.empty()) glGenQueries(1, &q); else { q = freeQ.back(); freeQ.pop_back(); }
+            glQueryCounter(q, 0x8E28);
+            pending.push_back({q, ts});
+            static const uint64_t periodNs = 1000000000ull / uint64_t(settings().gameHz > 0 ? settings().gameHz : 60);
+            while (!pending.empty()) {
+                GLint avail = 0; glGetQueryObjectiv(pending.front().id, 0x8867 /* RESULT_AVAILABLE */, &avail);
+                if (!avail) break;
+                uint64_t g = 0; glGetQueryObjectui64v(pending.front().id, 0x8866 /* RESULT */, &g);
+                const int64_t lat = int64_t(g) + offNs - int64_t(pending.front().cpuNs);
+                const uint64_t l = lat > 0 ? uint64_t(lat) : 0;
+                ++n; sum += l; worst = std::max(worst, l); if (l > periodNs) ++over;
+                freeQ.push_back(pending.front().id); pending.pop_front();
+            }
+            if (nowNs - lastLog > 2000000000ull && n) {
+                RLOG("[gpu] %.1f s: %llu images, GPU done %.2f ms after the flip on average, %.2f at worst, %llu past one refresh, %zu in flight\n",
+                     nowNs / 1e9, (unsigned long long)n, sum / 1e6 / n, worst / 1e6, (unsigned long long)over, pending.size());
+                n = over = worst = sum = 0; lastLog = nowNs;
+            }
+        }
         if (swapLog) { static uint64_t sum = 0, mx = 0, n = 0; const uint64_t d = SDL_GetTicksNS() - ts; sum += d; mx = std::max(mx, d); if (++n == 240) { RLOG("[swap] 240 presents: %.2f ms average, %.2f ms longest\n", sum / 240e6, mx / 1e6); sum = mx = n = 0; } }
     }
-    pump_events();
-    static uint64_t lastT = SDL_GetTicks(), lastF = 0;
-    const uint64_t now = SDL_GetTicks();
-    if (now - lastT >= 2000 && !settings().showFps && !std::getenv("FPSLOG")) { lastT = now; lastF = frameNo; }
-    if (now - lastT >= 2000) {
-        static const bool fpsLog = std::getenv("FPSLOG") != nullptr;   // FPSLOG=1: frame rate every 2 s in the log (benchmarks)
-        if (fpsLog) RLOG("[fps] %.1f s: %.1f\n", now / 1000.0, (frameNo - lastF) * 1000.0 / (now - lastT));
-        char title[160];
-        std::snprintf(title, sizeof title, "Racing Club+ - %.1f fps (F1: opciones)", (frameNo - lastF) * 1000.0 / (now - lastT),
-                      (unsigned long long)drawsThisFrame, programs.size());
-        SDL_SetWindowTitle(win, title);
-        lastT = now; lastF = frameNo;
-    }
-    drawsThisFrame = 0;
     if (const GLenum e = glGetError()) { static int n = 0; if (n++ < 20) RLOG("[rsx] GL error 0x%x (frame %llu)\n", e, (unsigned long long)frameNo); }
 }
 
-void method_block(uint32_t m0, const uint8_t* args, uint32_t count, bool noInc) {
-    // transform constants (several matrices per draw): straight into vpConst
-    if (!noInc && m0 >= 0x1f00 && m0 + 4 * count <= 0x1f80 && glOk && enabled()) {
-        for (uint32_t i = 0; i < count; ++i) {
-            uint32_t w; std::memcpy(&w, args + 4 * i, 4); w = __builtin_bswap32(w);
-            const uint32_t k = cLoad * 4 + vpConstWord;
-            if (k < 468 * 4) { std::memcpy(&vpConst[k], &w, 4); vpDirtyLo = std::min(vpDirtyLo, k); vpDirtyHi = std::max(vpDirtyHi, k + 1); vpConstDirty = true; }
-            if (++vpConstWord == 4) { vpConstWord = 0; ++cLoad; }
-        }
-        return;
-    }
-    // plain register writes (most of a draw's state) go straight to R; only the methods with side effects take the
-    // full path. This loop runs for every word of the command stream.
-    if (!glOk || !enabled() || rsxTrace) { for (uint32_t i = 0; i < count; ++i) { uint32_t w; std::memcpy(&w, args + 4 * i, 4); method(noInc ? m0 : m0 + 4 * i, __builtin_bswap32(w)); } return; }
-    // methods with side effects, as a prefix count: a packet without any is one byte-swapping copy into R
-    struct Special {
-        uint16_t before[0x4001];   // number of special methods below index i
-        bool is(uint32_t i) const { return before[i + 1] != before[i]; }
-        Special() {
-            uint16_t n = 0;
-            for (uint32_t i = 0; i < 0x4000; ++i) {
-                before[i] = n;
-                const uint32_t m = i * 4;
-                if ((m >= 0x0b80 && m < 0x0c00) || (m >= 0x1f00 && m < 0x1f80) || m == 0x1e9c || m == 0x1efc || m == 0x1808 || m == 0x1814 || m == 0x1824 || m == 0x1d94) ++n;
-            }
-            before[0x4000] = n;
-        }
-    };
-    static const Special sp;
-    const uint32_t i0 = m0 >> 2;
-    if (!noInc && i0 + count <= 0x4000 && sp.before[i0 + count] == sp.before[i0]) { bswap32_block(R + i0, args, count); return; }
-    for (uint32_t i = 0; i < count; ++i) {
-        uint32_t w; std::memcpy(&w, args + 4 * i, 4); w = __builtin_bswap32(w);
-        const uint32_t m = noInc ? m0 : m0 + 4 * i;
-        if (m >= 0x10000 || sp.is(m >> 2)) method(m, w);
-        else R[m >> 2] = w;
-    }
-}
+} // namespace
 
-void method(uint32_t m, uint32_t arg) {
-    if (!enabled()) return;
-    if (m >= 0x10000) return;
-    if (!initTried) init_gl();
-    if (!glOk) { R[m >> 2] = arg; return; }
-    if (rsxTrace) RLOG("[rsxm] %04x = %08x\n", m, arg);
-    if (m >= 0x0b80 && m < 0x0c00) {   // transform program words
-        if (vpLoad < 512 * 4) { vpCode[vpLoad++] = arg; ++vpGen; }
-        return;
+struct GlBackend final : Backend {
+    uint32_t window_flags() override { return SDL_WINDOW_OPENGL; }
+    bool init() override { return init_gl(); }
+    void new_frame() override { stateValid = false; }
+    void clear(uint32_t mask) override {
+        clear_surface(mask);
+        static const long logFrame = std::getenv("RSXLOG") ? std::atol(std::getenv("RSXLOG")) : -1;
+        if (long(frameNo) == logFrame) RLOG("[clear] fb %u\n", cur.fbo);
     }
-    if (m >= 0x1f00 && m < 0x1f80) {   // transform constants
-        const uint32_t i = cLoad * 4 + vpConstWord;
-        if (i < 468 * 4) { std::memcpy(&vpConst[i], &arg, 4); vpConstDirty = true; vpDirtyLo = std::min(vpDirtyLo, i); vpDirtyHi = std::max(vpDirtyHi, i + 1); }
-        if (++vpConstWord == 4) { vpConstWord = 0; ++cLoad; }
-        return;
-    }
-    switch (m) {
-        case 0x1e9c: vpLoad = (arg & 511) * 4; break;
-        case 0x1efc: cLoad = arg; vpConstWord = 0; break;
-        case 0x1808:   // SET_BEGIN_END
-            if (arg) { prim = arg; ranges.clear(); }
-            else { do_draw(); ranges.clear(); }
-            break;
-        case 0x1814: ranges.push_back({arg & 0xffffff, (arg >> 24) + 1}); rangesIndexed = false; break;   // DRAW_ARRAYS
-        case 0x1824: ranges.push_back({arg & 0xffffff, (arg >> 24) + 1}); rangesIndexed = true; break;    // DRAW_INDEX_ARRAY
-        case 0x1d94: {
-            clear_surface(arg);
-            static const long logFrame = std::getenv("RSXLOG") ? std::atol(std::getenv("RSXLOG")) : -1;
-            if (long(frameNo) == logFrame) RLOG("[clear] %x fb %u color %x (value %08x) z %x\n", arg, cur.fbo, R[0x210 >> 2], R[0x1d90 >> 2], R[0x214 >> 2]);
-            break;
-        }
-        default: break;
-    }
-    R[m >> 2] = arg;
-}
+    void draw() override { do_draw(); }
+    void present(const Display& d, int ww, int wh, const Overlay* ovl, int nOvl) override { present_gl(d, ww, wh, ovl, nOvl); }
+    void set_vsync(bool on) override { SDL_GL_SetSwapInterval(on); }
+    void textures_changed() override { ++g_texGen; }
+    const char* gpu_name() override { return reinterpret_cast<const char*>(glGetString(0x1F01 /* GL_RENDERER */)); }
+    const char* api_name() override { return "OpenGL"; }
+};
+Backend* make_gl_backend() { static GlBackend b; return &b; }
 
 } // namespace gti::recomp::rsx

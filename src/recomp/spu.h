@@ -48,6 +48,7 @@ public:
     uint32_t hookBelow = 0;
 
     uint32_t* interpHist = nullptr;   // debug: interpreted instructions per 256 bytes of local store (1024 counters)
+    bool dropPuts = false; uint64_t droppedPuts = 0;   // debug: ignore PUT commands (what a module writes to main memory)
     int mfcTrace = 0;         // debug: log this many MFC commands
     bool running = false;
     uint64_t steps = 0, interpSteps = 0, compiledCalls = 0;

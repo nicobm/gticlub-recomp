@@ -26,8 +26,15 @@ uint32_t g_worldEa = 0, g_physCalls = 0;
 // against the camera, which follows the physics. This returns an accumulator that makes the logic tick as often as
 // the world is about to step in this image (same formula as the world's scheduler at 0x31b788); where the world is
 // not running (menus, pause) the logic keeps its own 60 Hz clock. Original behaviour at 60 Hz (g_frameStep == 1).
+// the world's step this file wrote last (1/60 = the game's own): the image rate can change while the game runs
+static float g_worldStepSet = 1.0f / 60.0f;
+static bool world_step_ours(float v) { return std::fabs(v - 1.0f / 60.0f) < 1e-5f || std::fabs(v - g_worldStepSet) < 1e-5f; }
 double rc_logic_acc(PPU& c, double dtClamped, double acc) {
-    if (g_frameStep == 1.0f) return double(float(dtClamped + acc));
+    if (g_frameStep == 1.0f) {
+        if (g_worldStepSet != 1.0f / 60.0f && g_worldEa && world_step_ours(c.rdf32(g_worldEa + 156))) c.wrf32(g_worldEa + 156, 1.0f / 60.0f);   // back to 60 (options menu)
+        g_worldStepSet = 1.0f / 60.0f;
+        return double(float(dtClamped + acc));
+    }
     static uint32_t lastCalls = 0;
     static float own = 0;
     const float S = c.rdf32(uint32_t(c.r[25]) + 712);            // the scheduler's tick length
@@ -38,8 +45,23 @@ double rc_logic_acc(PPU& c, double dtClamped, double acc) {
     // PHYSHZ=0: the world keeps 1/60 s steps and the logic ticks with them (images between steps repeat, loose objects flicker).
     static const bool physHz = !(std::getenv("PHYSHZ") && std::getenv("PHYSHZ")[0] == '0');
     if (physHz && g_physCalls != lastCalls && g_worldEa) {
+        // One world step per image, of the real time that image took: 1/rate while the game keeps the rate, 2/rate
+        // when an image comes late (never longer than the console's 1/60). Before, the step was always 1/rate, so
+        // whenever the images per second dropped (144 setting, 85-130 fps in races) the cars and physics went slower
+        // than the logic, the clock and the sound: the game felt sped up against its own cars. WORLDFIX=0: old.
+        static const bool fixed = std::getenv("WORLDFIX") && std::getenv("WORLDFIX")[0] == '0';
+        static double wacc = 0;
+        const double base = double(g_frameStep) / 60.0;
+        int k = 1;
+        if (!fixed) {
+            const int kmax = std::max(1, int(1.0 / (60.0 * base) + 1e-6));   // 144 and 120: 2, 72: 1
+            wacc += dt > 0 && dt < 0.1f ? double(dt) : 0.0;
+            k = std::clamp(int(wacc / base + 0.3), 1, kmax);   // +0.3: an image a bit early still counts as one
+            wacc -= k * base;
+            if (wacc > 2 * kmax * base || wacc < -2 * base) wacc = 0;   // a load or a pause: nothing to catch up
+        }
         lastCalls = g_physCalls;
-        if (std::fabs(c.rdf32(g_worldEa + 156) - 1.0f / 60.0f) < 1e-5f) c.wrf32(g_worldEa + 156, g_frameStep / 60.0f);
+        if (world_step_ours(c.rdf32(g_worldEa + 156))) { g_worldStepSet = float(k * base); c.wrf32(g_worldEa + 156, g_worldStepSet); }
     }
     if (!physHz && g_physCalls != lastCalls && g_worldEa) {
         lastCalls = g_physCalls;

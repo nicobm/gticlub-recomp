@@ -17,4 +17,6 @@ bool audio_out_open() {
 // stereo frames waiting to be played
 int audio_out_queued() { return g_stream ? SDL_GetAudioStreamQueued(g_stream) / 8 : 0; }
 void audio_out_push(const float* stereo, int frames) { if (g_stream) SDL_PutAudioStreamData(g_stream, stereo, frames * 8); }
+// drops what is queued (the sound was switched off in the menu)
+void audio_out_clear() { if (g_stream) SDL_ClearAudioStream(g_stream); }
 } // namespace gti::recomp

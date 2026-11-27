@@ -3,8 +3,11 @@
 #include "recomp/settings.h"
 #include "recomp/rsx_gl.h"
 #include "recomp/spu_rt.h"
+#include "recomp/edge_cull.h"
+#include "recomp/edge_native.h"
 #include "recomp/hle.h"
 #include "recomp/spu.h"
+#include "recomp/atrac3.h"
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -13,6 +16,7 @@
 #include <deque>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <zlib.h>
 #include <map>
@@ -23,6 +27,10 @@
 #include <thread>
 #include <vector>
 
+namespace gti::recomp::netplay { bool in_room(); }
+namespace gti::recomp::netplay { struct Callback { uint32_t opd; int nargs; uint64_t a[8]; }; bool enabled(); bool hle(PPU& c, const char* module, const std::string& n); void set_errno_addr(uint32_t a); std::vector<Callback> take_callbacks(); }   // netplay.cpp
+namespace gti::recomp { void glyphs_patch_read(const std::string& hostPath, uint64_t fileOff, uint8_t* dst, size_t n); }   // button_glyphs.cpp
+namespace gti::recomp { bool host_camera_available(int choice); bool host_camera_start(int choice); void host_camera_stop(); uint32_t host_camera_read(uint8_t* dst, uint32_t cap, int format, int w, int h, uint32_t& frame); }   // host_camera.cpp
 namespace gti::recomp { void ripprof_register_thread(const char* name); void host_sleep_us(uint64_t us); void host_thread_priority_high(); void host_thread_core(bool own); void host_timer_init(); int host_display_hz(); bool host_set_refresh(int hz); void host_restore_refresh(); bool host_wait_refresh(); }   // ripprof.cpp, host_win.cpp   // ripprof.cpp
 namespace gti::recomp {
 
@@ -260,7 +268,10 @@ uint64_t g_profSem = 0, g_profFlip = 0, g_profClear = 0;   // FIFOPROF: label wa
 // S label wait starts, E label wait ends, F flip, D flip handler delivered
 long g_flStart = std::getenv("FRAMELOG") ? std::atol(std::getenv("FRAMELOG")) : -1;
 void fl(const char* tag, uint32_t v = 0);
-uint64_t g_frHoleUs = 0, g_frIdleUs = 0, g_frHoles = 0;   // FRAMELOG: time the FIFO waited at holes / for commands in this frame
+uint64_t g_frHoleUs = 0, g_frIdleUs = 0, g_frHoles = 0;
+// MISSLOG=1: every frame whose FIFO reached the vblank wait later than one refresh after the flip, with what it did
+const bool g_missLog = std::getenv("MISSLOG") != nullptr;
+const bool g_frAcct = g_flStart >= 0 || g_missLog;   // FRAMELOG: time the FIFO waited at holes / for commands in this frame
 std::atomic<uint32_t> g_vblankTick{0};   // bumped (and waiters woken) after every vblank handler call
 // A frame whose commands end a moment after a vblank used to wait for the next one: at 144 Hz a frame that needed
 // 7.2 ms instead of 6.9 took 13.9, and a scene on the edge fell to 72-100 images per second. When the RSX reaches the
@@ -331,16 +342,32 @@ void method(uint32_t m, uint32_t arg, uint32_t& semOff406e, uint32_t& semOff4097
                     g_mBuild = g_mRsx = g_mLate = g_mN = 0;
                 }
             }
+            if (semOff406e == 0x810 && g_missLog && g_tDeliver) {
+                static rsx::Counters c0{}; static bool have = false;
+                const rsx::Counters c1 = rsx::counters();
+                static const uint64_t period = 1000000 / uint64_t(settings().gameHz > 0 ? settings().gameHz : 60);
+                const uint64_t rsxT = ts - g_tDeliver, build = g_tPut > g_tDeliver ? g_tPut - g_tDeliver : 0;
+                if (have && rsxT > period)
+                    LOG("[miss] build %.1f rsx %.1f | holes %.1f (%llu) idle %.1f | draws %llu in %.1f ms, swap %.1f, progs %llu (%.1f ms), tex %llu (%llu KB, %.1f ms), streams %llu (%llu vertices, convert %.1f ms, buffers %.1f ms)\n",
+                        build / 1000.0, rsxT / 1000.0, g_frHoleUs / 1000.0, (unsigned long long)g_frHoles, g_frIdleUs / 1000.0,
+                        (unsigned long long)(c1.draws - c0.draws), (c1.drawUs - c0.drawUs) / 1000.0, (c1.swapUs - c0.swapUs) / 1000.0,
+                        (unsigned long long)(c1.progs - c0.progs), (c1.progUs - c0.progUs) / 1000.0, (unsigned long long)(c1.texUploads - c0.texUploads),
+                        (unsigned long long)((c1.texBytes - c0.texBytes) >> 10), (c1.texUs - c0.texUs) / 1000.0, (unsigned long long)(c1.streams - c0.streams), (unsigned long long)(c1.streamVerts - c0.streamVerts), (c1.convUs - c0.convUs) / 1000.0, (c1.bufUs - c0.bufUs) / 1000.0);
+                c0 = c1; have = true;
+            }
             if (semOff406e == 0x810) { fl("h", uint32_t(g_frHoleUs / 100)); fl("n", uint32_t(g_frHoles)); fl("i", uint32_t(g_frIdleUs / 100)); fl("S"); g_frHoleUs = g_frIdleUs = g_frHoles = 0; }
             if (semOff406e == 0x810) {   // waits for the vblank handler: woken by the vblank thread, not by polling
                 if (rd(labels + semOff406e) != arg && g_lateUs && g_vblankFree.exchange(false) && now_us() - g_lastVblankUs.load() < g_lateUs) {
                     call_guest(vblankHandler, 1); ++g_lateUsed; fl("L");
                 }
+                bool dumped = false;
                 for (;;) {
                     const uint32_t tick = g_vblankTick.load();
                     if (rd(labels + semOff406e) == arg || now_us() - ts > 2000000) break;
+                    if (g_missLog && !dumped && now_us() - ts > 20000) { dumped = true; LOG("[late] the RSX has waited %.1f ms for the game to release the vblank label:\n", (now_us() - ts) / 1000.0); lv2_dump_waits(); }
                     g_vblankTick.wait(tick);
                 }
+                if (dumped) LOG("[late] waited %.1f ms in all\n", (now_us() - ts) / 1000.0);
             } else
                 for (const uint64_t until = ts + 2000000; rd(labels + semOff406e) != arg && now_us() < until;) std::this_thread::yield();
             g_profSem += now_us() - ts;
@@ -433,7 +460,7 @@ void fifo_thread() {
         static uint64_t waitStart = 0; static int waitKind = 0;   // FRAMELOG accounting of waits
         if (get == put) {   // nothing to run: the game publishes commands within microseconds, so yield first and only sleep after a while
             const uint64_t t0 = now_us();
-            if (g_flStart >= 0 && waitKind != 2) { if (waitKind == 1) { g_frHoleUs += t0 - waitStart; ++g_frHoles; } waitStart = t0; waitKind = 2; }
+            if (g_frAcct && waitKind != 2) { if (waitKind == 1) { g_frHoleUs += t0 - waitStart; ++g_frHoles; } waitStart = t0; waitKind = 2; }
             static uint64_t idleSince = 0;
             if (!idle++) idleSince = t0;
             if (t0 - idleSince < 4000) std::this_thread::yield(); else std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -474,7 +501,7 @@ void fifo_thread() {
         uint32_t g2 = get;
         const uint32_t cmd = rd(io2ea(g2));
         const bool selfJump = ((cmd & 0xE0000003) == 0x20000000 && (cmd & 0x1FFFFFFC) == g2) || ((cmd & 3) == 1 && (cmd & 0xFFFFFFFC) == g2);
-        if (g_flStart >= 0) {
+        if (g_frAcct) {
             const int kind = selfJump ? 1 : 0;
             if (kind != waitKind) {
                 const uint64_t t = now_us();
@@ -569,49 +596,104 @@ void fifo_thread() {
 
 // GAMEHZ=n: rate of the emulated vblank (experiment: the console has 60)
 // streaming mode: 60 per second like the video (OBS, Twitch), so every game image is exactly one video frame
-const int g_gameHz = settings().streaming && !std::getenv("GAMEHZ") ? 60 : settings().gameHz;
+// Both follow the options menu while the game runs (vblank_thread checks them every vblank).
+// online game (in a room): 60 for everyone, as on the console, so no player runs differently from the others
+static int wanted_hz() { return (settings().streaming || gti::recomp::netplay::in_room()) && !std::getenv("GAMEHZ") ? 60 : settings().gameHz; }
+static bool wanted_refresh() { return settings().refresh || settings().streaming; }
+int g_gameHz = wanted_hz();
 // The game was written for 60 images per second: parts of its logic advance a fixed step per image. Patched code
 // scales that step by g_frameStep (FRAMESTEP=0: off).
-const bool g_frameStepInit = (g_frameStep = std::getenv("FRAMESTEP") && std::getenv("FRAMESTEP")[0] == '0' ? 1.0f : 60.0f / float(g_gameHz), true);
+static const bool g_noFrameStep = std::getenv("FRAMESTEP") && std::getenv("FRAMESTEP")[0] == '0';
+const bool g_frameStepInit = (g_frameStep = g_noFrameStep ? 1.0f : 60.0f / float(g_gameHz), true);
 void vblank_thread() {
     t_tid = 0x01000201;
     // Pacing of the emulated 60 Hz vblank. When the display refreshes at a multiple of 60 the vblank follows the real
     // refreshes (every image is then shown for the same number of them); a display at another rate (144 Hz) is
     // switched to 120 Hz while the game runs. REFRESCO=0 leaves the display alone, VBLANKTIMER=1 forces the timer.
     int perVblank = 0;   // display refreshes per vblank; 0 = timer
-    {
-        int hz = host_display_hz();
+    bool refreshNow = wanted_refresh();
+    int switchedTo = 0;   // the rate the display was switched to (0: its own)
+    bool waitBroken = false;   // host_wait_refresh() does not wait (see below)
+    const int nativeHz = host_display_hz();
+    auto setup = [&] {   // at start, and again when the options menu changes the rate or the display switch
         const char* e = std::getenv("REFRESCO");
-        if (hz > 0 && hz % g_gameHz != 0 && (settings().refresh || settings().streaming) && !(e && !std::strcmp(e, "0"))) {
-            const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
-            if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = want; }
+        const int want = e && std::atoi(e) > 0 ? std::atoi(e) : 120;
+        const bool needSwitch = nativeHz > 0 && nativeHz % g_gameHz != 0 && refreshNow && !(e && !std::strcmp(e, "0")) && want % g_gameHz == 0;
+        if (switchedTo && (!needSwitch || switchedTo != want)) { host_restore_refresh(); switchedTo = 0; LOG("[vblank] display back to %d Hz\n", nativeHz); }
+        int hz = switchedTo ? switchedTo : host_display_hz();
+        perVblank = 0;
+        if (needSwitch && !switchedTo) {
+            if (host_set_refresh(want)) { LOG("[vblank] display switched from %d to %d Hz while the game runs\n", hz, want); hz = switchedTo = want; }
             else LOG("[vblank] the display has no %d Hz mode: staying at %d Hz\n", want, hz);
         }
-        if (hz > 0 && hz % g_gameHz == 0 && !std::getenv("VBLANKTIMER")) perVblank = hz / g_gameHz;
-        LOG("[vblank] display %d Hz: vblank %s\n", hz, perVblank ? "follows the display refresh" : "on a 60 Hz timer");
-    }
+        if (hz > 0 && hz % g_gameHz == 0 && !std::getenv("VBLANKTIMER") && !waitBroken) perVblank = hz / g_gameHz;
+        LOG("[vblank] %d images per second, display %d Hz: vblank %s\n", g_gameHz, hz, perVblank ? "follows the display refresh" : "on a timer");
+    };
+    setup();
     auto next = std::chrono::steady_clock::now();
     uint64_t lastTick = now_us();
     int odd = 0;
     for (;;) {
+        {   // HZSWITCH=seconds:rate,... (debug): what the options menu does, at those times
+            static std::vector<std::pair<double, int>> sw; static bool parsed = false;
+            if (!parsed) { parsed = true; if (const char* e = std::getenv("HZSWITCH")) for (const char* q = e; *q;) { double t; int r; if (std::sscanf(q, "%lf:%d", &t, &r) == 2) sw.push_back({t, r}); while (*q && *q != ',') ++q; if (*q) ++q; } }
+            static const auto t0 = std::chrono::steady_clock::now();
+            if (!sw.empty() && std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() >= sw.front().first) { settings().gameHz = sw.front().second; sw.erase(sw.begin()); }
+        }
+        if (const int hz = wanted_hz(); hz > 0 && (hz != g_gameHz || wanted_refresh() != refreshNow)) {   // options menu
+            g_gameHz = hz; refreshNow = wanted_refresh();
+            if (!g_noFrameStep) g_frameStep = 60.0f / float(g_gameHz);
+            setup();
+            next = std::chrono::steady_clock::now(); lastTick = now_us();
+        }
         if (perVblank) {
             for (int k = 0; k < perVblank && perVblank; ++k) if (!host_wait_refresh()) perVblank = 0;
+            // VBLANKFASE=us: the game's vblank comes that long after the real refresh, so its image is presented in the
+            // middle of the refresh interval instead of right at the moment the compositor (DWM, windowed / borderless)
+            // picks the image up: one image a refresh at 120 Hz has no slack for a present landing on either side of it
+            // Default: half a refresh when every refresh carries a new image (120 on 120 Hz, 144 on 144 Hz); with two or
+            // more refreshes per image (72 on 144 Hz) there is slack and nothing changes. VBLANKFASE=0 turns it off.
+            {   static const char* const faseEnv = std::getenv("VBLANKFASE");
+                const long fase = faseEnv ? std::atol(faseEnv) : (perVblank == 1 ? 500000 / g_gameHz : 0);
+                if (fase > 0 && perVblank) host_sleep_us(uint64_t(fase)); }
             const uint64_t t = now_us(), dt = t - lastTick;
             lastTick = t;
+            if (g_missLog && dt * g_gameHz > 1500000) LOG("[vgap] %.1f ms between vblanks\n", dt / 1000.0);
             // the refreshes must really be 60 Hz: most of every 240 vblanks have to be 16.67 ms apart (stalls excluded)
             static int good = 0, seen = 0;
             (void)odd;
             if (dt * g_gameHz > 936000 && dt * g_gameHz < 1062000) ++good;
-            if (++seen == 240) {
-                if (good < 160) { LOG("[vblank] only %d of 240 vblanks were 16.67 ms apart (display reports %d Hz): back to the 60 Hz timer\n", good, host_display_hz()); perVblank = 0; host_restore_refresh(); }
+            {   // the wait returning at once (seen with the NVIDIA 621 driver: ~2 us): the vblanks would come in a burst.
+                // The timer then, for the rest of the run; the display keeps the rate it was switched to.
+                static int instant = 0;
+                instant = dt * g_gameHz < 100000 ? instant + 1 : 0;
+                if (instant >= 8) { LOG("[vblank] the display's vblank wait returns at once: vblank on a timer\n"); waitBroken = true; perVblank = 0; instant = good = seen = 0; }
+            }
+            if (perVblank && ++seen == 240) {
+                if (good < 160) { LOG("[vblank] only %d of 240 vblanks were 16.67 ms apart (display reports %d Hz): back to the 60 Hz timer\n", good, host_display_hz()); perVblank = 0; host_restore_refresh(); switchedTo = 0; }
                 good = seen = 0;
             }
             next = std::chrono::steady_clock::now();
         }
-        if (!perVblank) {   // sleep most of the interval, yield through the last 2 ms (Windows sleeps are coarse)
+        if (!perVblank) {   // sleep most of the interval, yield through the end of it
+            // A high resolution timer (host_sleep_us) wakes within ~0.1-0.5 ms, so only the last VBLANKSPIN us (300) are
+            // yielded through. Before, a plain sleep (1 ms or more on Windows) left 2 ms of yielding in every image:
+            // a quarter of a core at 120 images per second. VBLANKSPIN=2000 with VBLANKSLEEP=0: the old way.
+            static const int64_t spinUs = std::getenv("VBLANKSPIN") ? std::atoll(std::getenv("VBLANKSPIN")) : 300;
+            static const bool precise = !(std::getenv("VBLANKSLEEP") && std::getenv("VBLANKSLEEP")[0] == '0');
             next += std::chrono::microseconds(1000000 / g_gameHz);
-            std::this_thread::sleep_until(next - std::chrono::microseconds(2000));
+            const auto wakeAt = next - std::chrono::microseconds(spinUs);
+            if (precise) {
+                const int64_t us = std::chrono::duration_cast<std::chrono::microseconds>(wakeAt - std::chrono::steady_clock::now()).count();
+                if (us > 0) host_sleep_us(uint64_t(us));
+            } else std::this_thread::sleep_until(wakeAt);
             while (std::chrono::steady_clock::now() < next) std::this_thread::yield();
+        }
+        if (g_missLog) {   // a stretch without flips while the vblanks go on: what every thread is blocked in, once per stretch
+            static uint64_t lastFlips = 0, since = 0; static bool dumped = false;
+            const uint64_t f = flips.load(), t = now_us();
+            if (f != lastFlips) { lastFlips = f; since = t; dumped = false; }
+            else if (!dumped && since && t - since > 60000) { dumped = true; LOG("[stall] no flip for %.0f ms:\n", (t - since) / 1000.0); lv2_dump_waits(); }
         }
         if (flipPending.load()) { ++flips; call_guest(flipHandler, 1); flipPending = false; }
         { const uint32_t b = labels ? rd(labels + 0x810) : 0; call_guest(vblankHandler, 1); const uint32_t a = labels ? rd(labels + 0x810) : 0; fl("V", b * 16 + a); g_vblankFree = b == a; g_lastVblankUs = now_us(); }
@@ -789,11 +871,12 @@ uint32_t put_str(PPU& c, uint32_t dst, uint64_t cap, const std::string& s) {   /
 
 // Calls a guest function (OPD) from inside an HLE import on the same thread, then restores every register.
 // The callee gets a stack frame below `sp` (callers keep their scratch structs between sp and the old r1).
-uint64_t call_nested(PPU& c, uint32_t opd, uint32_t sp, uint64_t a0, uint64_t a1 = 0, uint64_t a2 = 0) {
+uint64_t call_nested(PPU& c, uint32_t opd, uint32_t sp, uint64_t a0, uint64_t a1 = 0, uint64_t a2 = 0, uint64_t a3 = 0, uint64_t a4 = 0,
+                     uint64_t a5 = 0, uint64_t a6 = 0, uint64_t a7 = 0) {
     PPU saved = c;
     c.r[1] = (sp & ~0xFu) - 0x100;
     c.r[2] = c.rd32(opd + 4);
-    c.r[3] = a0; c.r[4] = a1; c.r[5] = a2;
+    c.r[3] = a0; c.r[4] = a1; c.r[5] = a2; c.r[6] = a3; c.r[7] = a4; c.r[8] = a5; c.r[9] = a6; c.r[10] = a7;
     c.lr = 0;
     rc_call(c, c.rd32(opd));
     const uint64_t r = c.r[3];
@@ -904,7 +987,13 @@ uint32_t op(PPU& c, bool isSave) {
 namespace jobs {
 constexpr uint32_t LS_STUB = 0x100, LS_CTX = 0x2c00, LS_JOB = 0x2d00, LS_BIN = 0x3000, LS_STACK = 0x3fff0;
 constexpr uint32_t EVENTFLAG_JOB = 0xbad880;   // job binary that sets a SPURS event flag (done on the host)
-const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS"))) : 8;   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
+// Default by processor size: the game keeps ~6 other host threads busy (main, render, FIFO, job manager, sound,
+// streams), so the workers get what is left: 8 with 16 hardware threads, 6 with 12, 3 at least. More workers than
+// free hardware threads only add wake-up and contention costs (measured: each extra worker adds CPU use).
+// 4 at most: in a race at 120 fps the jobs keep ~1.9 host cores busy; 4 workers kept 120 fps with 18% less CPU of the
+// whole process than 8 (with the batched hand-over: 680% -> 555% of one core), 3 already lost a few images.
+const int g_workers = std::getenv("SPUS") ? std::max(1, std::atoi(std::getenv("SPUS")))
+                                          : (std::thread::hardware_concurrency() <= 4 ? 2 : std::clamp(int(std::thread::hardware_concurrency()) - 6, 3, 4));   // 2 cores / 4 threads: 2 workers kept more images (AFFINITY=f test)   // host threads running jobs. The game only describes Edge output buffers for SPUs 0-2; run_job creates those of workers 3-5 (more than 6 have none and would drop their geometry)
 
 uint32_t list = 0;
 std::thread th;
@@ -952,15 +1041,199 @@ thread_local int t_spuNum = 0;
 Spu* g_workerSpu[16] = {};                     // per worker: its SPU and the job it is running (diagnostics)
 std::atomic<uint32_t> g_workerJob[16] = {};
 std::atomic<uint64_t> g_workerSince[16] = {};   // now_us() when that job started
+// CULLCAP=dir,seconds,n: local store + registers at entry (LS 0x9e68) and return (0x4400) of Edge's triangle culling routine,
+// for n jobs from `seconds` after the first Edge job -> dir/cull_NNNN_in.bin / _out.bin (256 KB local store, then 128 registers of 16 bytes)
+static uint32_t edge_cull_capture(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    static char dir[256]; static long left = -1, first = 0; static uint64_t t0 = 0;
+    static std::atomic<long> seq{0};
+    static thread_local long mine = -1;
+    if (left < 0) { left = 0; if (const char* e = std::getenv("CULLCAP")) { long n = 0; if (std::sscanf(e, "%255[^,],%ld,%ld", dir, &first, &n) == 3) left = n; } t0 = now_us(); }
+    if (pc != 0x9e68 && pc != 0x4400) return pc;
+    if (pc == 0x4400 && mine < 0) return pc;
+    if (pc == 0x9e68) { if (now_us() - t0 < uint64_t(first) * 1000000u) return pc; mine = seq++; if (mine >= left) { mine = -1; return pc; } }
+    char fn[300]; std::snprintf(fn, sizeof fn, "%s/cull_%04ld_%s.bin", dir, mine, pc == 0x9e68 ? "in" : "out");
+    if (FILE* f = std::fopen(fn, "wb")) {
+        std::fwrite(s.ls, 1, Spu::LS_SIZE, f);
+        for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; const uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f); }
+        std::fclose(f);
+    }
+    if (pc == 0x4400) mine = -1;
+    return pc;
+}
+// FNCAP=entry,return,dir,seconds,n (hex LS addresses): the same capture for any Edge routine that only works on the
+// local store -> dir/fn_NNNN_in.bin / _out.bin (tool: fn_replay). Native culling keeps running around it.
+static uint32_t g_fnCapEntry = 0, g_fnCapRet = 0;
+static uint32_t edge_hle(spurt::Q* __restrict r, Spu& s, uint32_t pc);
+static uint32_t edge_fn_capture(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    static char dir[256]; static long left = 0, first = 0; static uint64_t t0 = 0;
+    static std::atomic<long> seq{0};
+    static std::once_flag once;
+    static thread_local long mine = -1;
+    static thread_local uint32_t entryR1 = 0;
+    std::call_once(once, [] { long n = 0; if (std::sscanf(std::getenv("FNCAP"), "%x,%x,%255[^,],%ld,%ld", &g_fnCapEntry, &g_fnCapRet, dir, &first, &n) == 5) left = n; t0 = now_us(); });
+    if (pc == g_fnCapEntry || (pc == g_fnCapRet && mine >= 0 && r[1].w[0] == entryR1)) {
+        bool take = true;
+        if (pc == g_fnCapEntry) {
+            if (now_us() - t0 < uint64_t(first) * 1000000u) take = false;
+            else { mine = seq++; if (mine >= left) { mine = -1; take = false; } else entryR1 = r[1].w[0]; }
+        }
+        if (take) {
+            char fn[300]; std::snprintf(fn, sizeof fn, "%s/fn_%04ld_%s.bin", dir, mine, pc == g_fnCapEntry ? "in" : "out");
+            if (FILE* f = std::fopen(fn, "wb")) {
+                std::fwrite(s.ls, 1, Spu::LS_SIZE, f);
+                for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; const uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f); }
+                std::fclose(f);
+            }
+            if (pc == g_fnCapRet) mine = -1;
+        }
+    }
+    return edge_hle(r, s, pc);
+}
+
+// CULLTIME=1: time spent inside Edge's culling routine, against the whole Edge jobs ([culltime] every 2^16 calls)
+static std::atomic<uint64_t> g_cullNs{0}, g_cullCalls{0};
+static uint32_t edge_cull_time(spurt::Q* __restrict, Spu&, uint32_t pc) {
+    static thread_local std::chrono::steady_clock::time_point t;
+    static thread_local bool in = false;
+    if (pc == 0x9e68) { t = std::chrono::steady_clock::now(); in = true; }
+    else if (pc == 0x4400 && in) { in = false; g_cullNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count()); ++g_cullCalls; }
+    return pc;
+}
+
+// Edge's triangle culling done natively (edge_cull.cpp) instead of by the SPU program. EDGENATIVE=0: SPU code;
+// EDGECHECK=1: both, checking that ours keeps every triangle the SPU keeps ([edgecheck]); EDGEPOISON=1: native, and
+// the per-vertex screen data the SPU routine would have written is filled with garbage (nothing later may read it).
+static inline uint32_t rd32ls(const uint8_t* ls, uint32_t a) { const uint8_t* p = ls + (a & 0x3fffc); return uint32_t(p[0]) << 24 | p[1] << 16 | p[2] << 8 | p[3]; }
+static thread_local uint64_t t_jobSeq = 0;   // jobs run by this worker (pairs the culling routine's entry and return)
+static std::atomic<uint64_t> g_chkUnpaired{0};
+static std::atomic<uint64_t> g_chkJobs{0}, g_chkBad{0}, g_chkUnhandled{0}, g_chkTrisSpu{0}, g_chkTrisOurs{0};
+static uint32_t edge_hle(spurt::Q* __restrict r, Spu& s, uint32_t pc) {
+    if ((pc == 0x7140 || pc == 0x12780 || pc == 0x12628) && g_fnCapEntry != pc) {   // edge_native.cpp (FNCAP of the routine itself: keep the SPU code)
+        uint32_t a[8], ret = 0;
+        for (int i = 0; i < 8; ++i) a[i] = r[3 + i].w[0];
+        if (!edge_native_run(pc, s.ls, a, r[1].w[0], &ret)) return pc;
+        // what the SPU routine leaves that may matter: r3, and its prologue's link register save at r1 + 16
+        r[3].w[0] = ret;
+        uint8_t* d = s.ls + ((r[1].w[0] + 16) & 0x3fff0);
+        for (int k = 0; k < 4; ++k) { const uint32_t v = r[0].w[k]; d[4 * k] = uint8_t(v >> 24); d[4 * k + 1] = uint8_t(v >> 16); d[4 * k + 2] = uint8_t(v >> 8); d[4 * k + 3] = uint8_t(v); }
+        return r[0].w[0] & 0x3fffc;
+    }
+    if (pc != 0x9e68 && pc != 0x4400) return pc;
+    static const bool timing = std::getenv("CULLTIME") != nullptr, check = std::getenv("EDGECHECK") != nullptr,
+                      poison = std::getenv("EDGEPOISON") != nullptr;
+    static thread_local std::chrono::steady_clock::time_point t;
+    static thread_local bool in = false, pending = false;
+    static thread_local uint8_t* copy = nullptr;
+    static thread_local uint8_t* orig = nullptr;     // EDGECHECK: entry state (local store + registers), dumped when ours misses a triangle
+    static thread_local uint32_t ourCount, ourIdx, entryR1;
+    static thread_local uint64_t entryJob;
+    auto timeEnd = [&] {
+        if (timing && in) { in = false; g_cullNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t).count()); ++g_cullCalls; }
+    };
+    if (pc == 0x9e68) {
+        if (timing) { t = std::chrono::steady_clock::now(); in = true; }
+        const uint32_t ctx = r[3].w[0], mode = r[4].w[0], r1 = r[1].w[0];
+        if (check) {
+            if (!copy) { copy = new uint8_t[Spu::LS_SIZE]; orig = new uint8_t[Spu::LS_SIZE + 128 * 16]; }
+            std::memcpy(copy, s.ls, Spu::LS_SIZE);
+            std::memcpy(orig, s.ls, Spu::LS_SIZE);
+            for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; uint8_t* d = orig + Spu::LS_SIZE + 16 * i + 4 * k; d[0] = uint8_t(v >> 24); d[1] = uint8_t(v >> 16); d[2] = uint8_t(v >> 8); d[3] = uint8_t(v); }
+            const EdgeCullResult cr = edge_cull_native(copy, ctx, mode, r1);
+            if (pending) ++g_chkUnpaired;
+            pending = cr.handled; entryJob = t_jobSeq; entryR1 = r1; ourCount = cr.count; ourIdx = rd32ls(copy, (ctx & 0x3fff0) + 0x50);
+            if (!cr.handled) ++g_chkUnhandled;
+            return pc;   // the SPU code runs as well
+        }
+        const EdgeCullResult cr = edge_cull_native(s.ls, ctx, mode, r1);
+        if (!cr.handled) return pc;
+        for (int k = 0; k < 4; ++k) r[3].w[k] = cr.count;
+        if (poison) {
+            const uint32_t nv = rd32ls(s.ls, (ctx & 0x3fff0) + 8) >> 16, out = rd32ls(s.ls, (ctx & 0x3fff0) + 0x14) & 0x3fff0;
+            if (out + nv * 16 <= Spu::LS_SIZE) std::memset(s.ls + out, 0xA5, nv * 16);
+        }
+        timeEnd();
+        return r[0].w[0] & 0x3fffc;   // back to the caller (0x4400)
+    }
+    timeEnd();
+    if (pending && (entryJob != t_jobSeq || r[1].w[0] != entryR1)) { pending = false; ++g_chkUnpaired; }
+    if (pending) {   // EDGECHECK: the SPU result is in s.ls / r3, ours in copy
+        pending = false;
+        const uint32_t spuCount = r[3].w[0];
+        uint32_t k = 0; bool sup = true;
+        for (uint32_t i = 0; i < spuCount && sup; i += 3) {
+            while (k < ourCount && std::memcmp(copy + ourIdx + 2 * k, s.ls + ourIdx + 2 * i, 6)) k += 3;
+            if (k >= ourCount) sup = false; else k += 3;
+        }
+        g_chkTrisSpu += spuCount / 3; g_chkTrisOurs += ourCount / 3;
+        if (!sup) {   // EDGECHECK=dir: keep the job (cull_replay format) for analysis
+            const long n = long(g_chkBad.load());
+            const char* dir = std::getenv("EDGECHECK");
+            if (n < 40 && dir && std::strlen(dir) > 1) {
+                char fn[300];
+                std::snprintf(fn, sizeof fn, "%s/cull_%04ld_in.bin", dir, n);
+                if (FILE* f = std::fopen(fn, "wb")) { std::fwrite(orig, 1, Spu::LS_SIZE + 128 * 16, f); std::fclose(f); }
+                std::snprintf(fn, sizeof fn, "%s/cull_%04ld_out.bin", dir, n);
+                if (FILE* f = std::fopen(fn, "wb")) {
+                    std::fwrite(s.ls, 1, Spu::LS_SIZE, f);
+                    for (int i = 0; i < 128; ++i) for (int k = 0; k < 4; ++k) { const uint32_t v = r[i].w[k]; const uint8_t b[4] = {uint8_t(v >> 24), uint8_t(v >> 16), uint8_t(v >> 8), uint8_t(v)}; std::fwrite(b, 1, 4, f); }
+                    std::fclose(f);
+                }
+            }
+        }
+        if (!sup && g_chkBad++ < 20) LOG("[edgecheck] job %llu: a triangle the SPU keeps is missing (SPU %u indices, ours %u)\n", (unsigned long long)g_chkJobs.load(), spuCount, ourCount);
+        if ((++g_chkJobs & 0xffff) == 0)
+            LOG("[edgecheck] %llu jobs, %llu with a missing triangle, %llu unpaired, %llu not handled, triangles SPU %llu ours %llu (+%.2f%%)\n", (unsigned long long)g_chkJobs.load(),
+                (unsigned long long)g_chkBad.load(), (unsigned long long)g_chkUnpaired.load(), (unsigned long long)g_chkUnhandled.load(), (unsigned long long)g_chkTrisSpu.load(), (unsigned long long)g_chkTrisOurs.load(),
+                g_chkTrisSpu ? 100.0 * (double(g_chkTrisOurs) - double(g_chkTrisSpu)) / double(g_chkTrisSpu) : 0.0);
+    }
+    return pc;
+}
+
 void run_job(const JobDesc& J) {
+    static const bool cullCapOn = [] {
+        if (std::getenv("CULLCAP")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_capture;
+        else if (!std::getenv("EDGENATIVE") || std::atoi(std::getenv("EDGENATIVE")) != 0 || std::getenv("EDGECHECK")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_hle;
+        else if (std::getenv("CULLTIME")) spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_cull_time;
+        // all three hooks only look at the culling routine's entry and its return
+        uint32_t* pcs = spurt::g_spuHlePcs[(0xbaea80u >> 4) % 64];
+        pcs[0] = 0x9e68; pcs[1] = 0x4400;
+        pcs[2] = 0x7140; pcs[3] = 0x12780; pcs[4] = 0x12628;   // native routines of edge_native.cpp (edge_hle)
+        if (std::getenv("FNCAP")) {
+            spurt::g_spuHle[(0xbaea80u >> 4) % 64] = edge_fn_capture;
+            uint32_t e = 0, rt = 0;
+            std::sscanf(std::getenv("FNCAP"), "%x,%x", &e, &rt);
+            pcs[6] = e; pcs[7] = rt;
+        }
+        return true; }();
+    (void)cullCapOn;
+    ++t_jobSeq;
     const uint32_t jea = J.jea;
-    static thread_local Spu* spu = new Spu;
     const uint32_t eaBin = uint32_t(jd32(J, 4)) & ~0xFu;
+    // one local store per job binary on each worker: the game interleaves the dispatcher (0xba3680) with the Edge
+    // jobs, and with a single one the 64 KB Edge binary was copied in again for a third of its jobs. Each binary
+    // keeps its own resident image, as it would while consecutive jobs use it. JOBONELS=1: the old single one.
+    struct LsSlot { uint32_t bin = 0, resident = 0; Spu* spu = nullptr; };
+    static thread_local LsSlot slots[4];
+    static const bool oneLs = std::getenv("JOBONELS") != nullptr;
+    LsSlot* slot = &slots[0];
+    if (!oneLs) {
+        int k = 0;
+        while (k < 4 && slots[k].spu && slots[k].bin != eaBin) ++k;
+        if (k == 4) k = 3;   // more binaries than slots: the last slot is shared
+        slot = &slots[k];
+        if (!slot->spu) slot->bin = eaBin;
+    }
+    if (!slot->spu) { slot->spu = new Spu; std::memset(slot->spu->ls, 0, Spu::LS_SIZE); }
+    Spu* const spu = slot->spu;
     const uint32_t sizeBin = uint32_t(jd16(J, 8)) * 16, sizeDma = jd16(J, 0xa);
     const uint32_t sizeInOut = jd32(J, 0x14), sizeOut = jd32(J, 0x18);
     const uint32_t sizeCacheDma = jd32(J, 0x24);
     ++jobsRun;
-    {
+    static thread_local uint32_t seenHere[8]; static thread_local unsigned nSeenHere = 0;   // binaries this worker has met
+    bool newHere = true;
+    for (unsigned k = 0; k < nSeenHere; ++k) if (seenHere[k] == eaBin) { newHere = false; break; }
+    if (newHere && nSeenHere < 8) seenHere[nSeenHere++] = eaBin;
+    if (newHere) {   // (a global lock per job was measurable with 8 workers)
         static std::mutex seenMx; static std::map<uint32_t, int> seen;
         std::lock_guard<std::mutex> lk(seenMx);
         if (!seen[eaBin]++) LOG("[job] binary %x: %u bytes (descriptor %x)\n", eaBin, sizeBin, jea);
@@ -1002,7 +1275,10 @@ void run_job(const JobDesc& J) {
     s.mem = G->mem;
     s.reset();
     s.steps = 0;
-    std::memset(s.ls, 0, 0x3000);
+    // the kernel area and the job context/descriptor are rewritten below; the 10 KB between them stay zero from the
+    // creation of the local store (nothing writes there; clearing all 12 KB per job was 2-3 % of the workers). JOBCLEAR=1: as before
+    static const bool clearAll = std::getenv("JOBCLEAR") != nullptr;
+    if (clearAll) std::memset(s.ls, 0, 0x3000); else { std::memset(s.ls, 0, 0x400); std::memset(s.ls + LS_CTX, 0, LS_BIN - LS_CTX); }
     s.lssw(LS_STUB, 0x00003fff);   // stop 0x3fff: the job returned
     // SPURS kernel context (LS 0x100..): spuNum at 0x1C8 (cellSpursGetCurrentSpuId). Edge geometry keeps one output
     // ring per SPU, so every worker must report its own number.
@@ -1011,7 +1287,7 @@ void run_job(const JobDesc& J) {
     // like the SPURS job manager: the local store is not cleared, and the binary stays resident while consecutive
     // jobs on this SPU use the same one (JOBRELOAD=1 restores the old clear-and-reload behaviour)
     static const bool reload = std::getenv("JOBRELOAD") != nullptr;
-    static thread_local uint32_t residentBin = 0;
+    uint32_t& residentBin = slot->resident;
     if (reload) std::memset(s.ls + 0x3000, 0, Spu::LS_SIZE - 0x3000);
     if (reload || residentBin != eaBin) { std::memcpy(s.ls + LS_BIN, G->mem + eaBin, std::min<uint32_t>(sizeBin, 0x30000)); residentBin = eaBin; }
     const uint32_t lsIo = (LS_BIN + sizeBin + 127) & ~127u;   // buffers follow the binary (its size covers .bss)
@@ -1210,6 +1486,9 @@ void run_job(const JobDesc& J) {
         if (std::chrono::steady_clock::now() - last > std::chrono::seconds(4)) {
             last = std::chrono::steady_clock::now();
             for (auto& kv : perBin) LOG("[jobs]   binary %x: %llu jobs, %.1f us/job\n", kv.first, (unsigned long long)kv.second.first, kv.second.second / 1e3 / std::max<uint64_t>(1, kv.second.first));
+            if (std::getenv("EDGESTAT2")) LOG("[edgenative] native / left to the SPU: 0x7140 %llu/%llu, 0x12780 %llu/%llu, 0x12628 %llu/%llu\n", (unsigned long long)g_edgeNativeCalls[0], (unsigned long long)g_edgeNativeFallbacks[0],
+                (unsigned long long)g_edgeNativeCalls[1], (unsigned long long)g_edgeNativeFallbacks[1], (unsigned long long)g_edgeNativeCalls[2], (unsigned long long)g_edgeNativeFallbacks[2]);
+            if (g_cullCalls) { LOG("[culltime] %llu culling calls, %.1f us each\n", (unsigned long long)g_cullCalls.load(), g_cullNs.load() / 1e3 / g_cullCalls.load()); g_cullNs = 0; g_cullCalls = 0; }
             perBin.clear();
             if (spurt::g_spuProf) {
                 const int row = int((0xbaea80u >> 4) % 64);
@@ -1268,6 +1547,12 @@ std::mutex qmx;
 std::condition_variable qcv, idlecv;
 std::deque<JobDesc> queue;
 int busy = 0;
+// Wakeups cost more than most jobs (~140k jobs/s in a race): jobs the manager reads one after the other are handed
+// over together (flush_jobs) and only sleeping workers are woken; the manager is woken only when all went idle.
+// JOBBATCH=0: one job at a time, every worker / manager notified each time (old).
+int sleepers = 0, idleWaiters = 0;
+const bool g_jobBatch = !(std::getenv("JOBBATCH") && std::getenv("JOBBATCH")[0] == '0');
+std::vector<JobDesc> g_batch;   // manager thread only
 // Edge geometry writes its output into one ring per SPU and waits for the RSX (through a label) when the ring is
 // full. The game only hands a frame to the RSX once all its jobs are done, so a frame that needs more than a whole
 // ring can never finish: the job waits for the RSX and the RSX has nothing to run. The console never gets there;
@@ -1302,13 +1587,27 @@ void worker(int idx) {
         JobDesc jd;
         {
             std::unique_lock<std::mutex> lk(qmx);
-            qcv.wait(lk, [] { return !queue.empty(); });
+            if (queue.empty()) { ++sleepers; qcv.wait(lk, [] { return !queue.empty(); }); --sleepers; }
             jd = std::move(queue.front()); queue.pop_front(); ++busy;
         }
         run_job(jd);
-        { std::lock_guard<std::mutex> lk(qmx); --busy; }
-        idlecv.notify_all();
+        bool wake;
+        { std::lock_guard<std::mutex> lk(qmx); --busy; wake = !g_jobBatch || (busy == 0 && queue.empty() && idleWaiters > 0); }
+        if (wake) idlecv.notify_all();
     }
+}
+void flush_jobs() {
+    if (g_batch.empty()) return;
+    const int n = int(g_batch.size());
+    int sl;
+    {
+        std::lock_guard<std::mutex> lk(qmx);
+        for (auto& j : g_batch) queue.push_back(std::move(j));
+        sl = sleepers;
+    }
+    g_batch.clear();
+    if (sl <= 0) return;
+    if (n >= sl) qcv.notify_all(); else for (int k = 0; k < n; ++k) qcv.notify_one();
 }
 void submit(uint32_t jea) {
     JobDesc jd;
@@ -1326,6 +1625,7 @@ void submit(uint32_t jea) {
         for (uint32_t k = 0; k < sizeCacheDma / 8 && k < 4; ++k) { const uint32_t sz = jd32(jd, 0x30 + sizeDma + 8 * k) & 0x7fff; std::memcpy(jd.in.data() + pos, G->mem + jd32(jd, 0x34 + sizeDma + 8 * k), sz); pos += sz; }
     }
     if (g_workers == 1) { run_job(jd); return; }
+    if (g_jobBatch) { g_batch.push_back(std::move(jd)); static const int batchN = std::getenv("JOBBATCHN") ? std::atoi(std::getenv("JOBBATCHN")) : 2 * g_workers; if (int(g_batch.size()) >= batchN) flush_jobs(); return; }
     { std::lock_guard<std::mutex> lk(qmx); queue.push_back(std::move(jd)); }
     qcv.notify_one();
 }
@@ -1336,9 +1636,12 @@ const bool g_mgrStat = std::getenv("MGRSTAT") != nullptr;
 void wait_idle(int why = 0) {
     if (g_workers == 1) return;
     const uint64_t t0 = g_mgrStat ? now_us() : 0;
+    flush_jobs();
     {
         std::unique_lock<std::mutex> lk(qmx);
+        ++idleWaiters;
         idlecv.wait(lk, [] { return queue.empty() && busy == 0; });
+        --idleWaiters;
     }
     if (g_mgrStat) { ++g_wiN[why]; g_wiUs[why] += now_us() - t0; }
 }
@@ -1379,6 +1682,7 @@ void manager() {
         if (w == 0) {   // a zero may be a slot the game is rewriting right now: give it a moment before skipping it
                         // (skipping a NEXT being written left the manager on a stale END for good, ~1 run in 2 at 144 Hz)
             bool changed = false;
+            flush_jobs();
             for (const uint64_t t0 = now_us(); now_us() - t0 < 2000;) { if (rd64m(pc) != 0) { changed = true; break; } std::this_thread::yield(); }
             if (changed) continue;
             pc += 8; continue;
@@ -1387,6 +1691,7 @@ void manager() {
             if ((rd32m(ea + 4) & ~0xFu) == EVENTFLAG_JOB) { wait_idle(4); pendingEf.push_back(ea); pc += 8; continue; }
             flushEf(); submit(ea); ++g_mgrJobs; pc += 8; continue;
         }
+        flush_jobs();   // any other command: the jobs read so far go to the workers now
         switch (op) {
             case 1: pc = ea; continue;                                  // RESET_PC
             case 2: case 5: g_mgrWhat = 3; wait_idle(op == 2 ? 0 : 1); pc += 8; continue;             // SYNC / LWSYNC / labels / FLUSH
@@ -1396,6 +1701,7 @@ void manager() {
                 flushEf();
                 const uint32_t n = rd32m(ea), sz = rd32m(ea + 4), lst = uint32_t(rd64m(ea + 8));
                 for (uint32_t k = 0; k < n; ++k) submit(lst + k * sz);
+                flush_jobs();
                 pc += 8; continue;
             }
             default: break;
@@ -1470,6 +1776,7 @@ thread_local WaitSlot* t_waitSlot = nullptr;
 // block, and whose output that thread copies into the cellAudio port ring. Here every such task gets its own SPU
 // (interpreter) on a host thread, and a host thread plays the ring through SDL and advances its read index.
 namespace snd {
+std::atomic<uint64_t> g_sndSys[4];   // SPURS task syscalls of the sound task (statistics)
 struct Task {
     Spu spu;
     std::mutex m; std::condition_variable cv;
@@ -1481,6 +1788,120 @@ std::atomic<uint64_t> g_signals{0}, g_passes{0};
 std::atomic<uint64_t> g_waits{0}, g_busySum{0}, g_busyMax{0}, g_wake{0}, g_slow{0};   // mixer pass statistics
 std::vector<Task*> g_tasks;
 uint32_t be32(uint32_t a) { uint32_t x; std::memcpy(&x, G->mem + a, 4); return __builtin_bswap32(x); }
+
+// Our ATRAC3 decoder in place of the system software's module (flashATRAC.pic). The mixer calls the module's decode
+// function with r3 = LS of the compressed frame (2 sound units of 0x98 bytes), r4 = LS of the output (channel c at
+// r4 + c * 0x1000), r6 = 0x400, r7 = LS of the voice's context (+0x20: flags, top byte 2 when the voice starts a new
+// sound, 1 otherwise; +0x34: the context's address in main memory, used here as the voice's identity).
+// Per voice the module alternates: on a start it decodes nothing and asks for a frame (returns 0x200); then one call
+// decodes the frame it is given (returns 0) and the next one hands out the rest (returns 0x200, a new frame please).
+// Each call writes 1024 big-endian 16-bit samples per channel (inverted polarity, x * -32768) and 4 more samples
+// extrapolated from the last two: after a decode, the second half of the previous frame and the first half of the
+// new one; on the next call, the whole new frame. Returns r3 = {0 or 0x200, 2, 0x98, 0}.
+// Matches the module's output to +-1 in the 16-bit samples (FFmpeg-exact decoding; see NOTAS_NOCHE.md).
+struct AtracVoice {
+    static constexpr int kMax = 6;
+    int nch = 0;
+    std::unique_ptr<atrac3::Decoder> dec;
+    float cur[kMax][1024] = {}, prevHalf[kMax][512] = {};
+    int stage = 0;   // 0 start (next call asks for a frame), 1 a frame comes now, 2 second half
+    uint64_t frames = 0, calls = 0, firstUs = 0;   // statistics (ATRACSTAT)
+    uint32_t resUnit = 0, resBits = 0;   // result block: offset of the last decoded sound unit, bits the decoder read of it
+    void reset(int channels) {
+        if (channels != nch || !dec) { nch = channels; dec = std::make_unique<atrac3::Decoder>(channels, 0x98); }
+        else dec->reset();
+        std::memset(cur, 0, sizeof cur); std::memset(prevHalf, 0, sizeof prevHalf); stage = 0;
+    }
+};
+std::map<uint32_t, std::unique_ptr<AtracVoice>> g_atracVoices;   // only the mixer task thread uses it
+std::atomic<uint64_t> g_atracFrames{0}, g_atracBad{0};
+// ATRACSEQ=from,to (seconds since launch): one line per decode call (voice, flags, first frame bytes, r3 returned)
+void atrac_seq(const char* who, uint32_t key, uint32_t flags, const uint8_t* fr, uint32_t ret) {
+    static double from = -1, to = 0;
+    if (from < 0) { from = 1e9; if (const char* e = std::getenv("ATRACSEQ")) std::sscanf(e, "%lf,%lf", &from, &to); }
+    const double t = log_seconds();
+    if (t < from || t > to) return;
+    LOG("[seq] %s %8.3f voice %08x flags %08x frame %02x%02x%02x%02x ret %x%c", who, t, key, flags, fr ? fr[0] : 0, fr ? fr[1] : 0, fr ? fr[2] : 0, fr ? fr[3] : 0, ret, 10);
+}
+// channels of a voice: second byte of its context flags (2 or 6; the frame holds that many 0x98-byte sound units)
+int atrac_channels(uint32_t flags) { const int n = int((flags >> 16) & 0xff); return n >= 1 && n <= AtracVoice::kMax ? n : 2; }
+// one call: the n x 1028 samples to write (n = channels of the voice); returns the value for r3
+uint32_t atrac_compute(const uint8_t* frame, uint32_t key, uint32_t flags, int16_t (&s)[AtracVoice::kMax][1028], int& n) {
+    auto& slot = g_atracVoices[key];
+    if (!slot) slot = std::make_unique<AtracVoice>();
+    AtracVoice& v = *slot;
+    n = atrac_channels(flags);
+    if (!v.firstUs) v.firstUs = now_us();
+    ++v.calls;
+    if ((flags >> 24) == 2 || v.nch != n) v.reset(n);
+    float win[AtracVoice::kMax][1024];
+    float* o[AtracVoice::kMax];
+    for (int c = 0; c < n; ++c) o[c] = v.cur[c];
+    uint32_t ret;
+    if (v.stage == 1) {
+        for (int c = 0; c < n; ++c) std::memcpy(v.prevHalf[c], v.cur[c] + 512, sizeof v.prevHalf[c]);
+        if (frame) { if (!v.dec->decode(frame, o)) ++g_atracBad; ++g_atracFrames; ++v.frames; v.resUnit = 0x98u * uint32_t(n - 1); v.resBits = uint32_t(v.dec->bitsUsed(n - 1)); }
+        for (int c = 0; c < n; ++c) { std::memcpy(win[c], v.prevHalf[c], 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
+        v.stage = 2; ret = 0;
+    } else {
+        if (v.stage == 0 && frame && (frame[0] >> 2) == 0x28) {   // start: the first frame primes the decoder; out goes
+            if (!v.dec->decode(frame, o)) ++g_atracBad;            // (silence) + the first half of that frame
+            v.resUnit = 0x98u * uint32_t(n - 1); v.resBits = uint32_t(v.dec->bitsUsed(n - 1));
+            for (int c = 0; c < n; ++c) { std::memset(win[c], 0, 512 * 4); std::memcpy(win[c] + 512, v.cur[c], 512 * 4); }
+        } else for (int c = 0; c < n; ++c) std::memcpy(win[c], v.cur[c], 1024 * 4);
+        v.stage = 1; ret = 0x200;
+    }
+    for (int c = 0; c < n; ++c) {
+        for (int i = 0; i < 1024; ++i) s[c][i] = int16_t(std::clamp(std::lrintf(win[c][i] * -32768.0f), -32768L, 32767L));
+        for (int i = 0; i < 4; ++i)   // 16-bit wrap-around like the module (no clamping)
+            s[c][1024 + i] = int16_t(uint16_t(int(s[c][1023]) + (i + 1) * (int(s[c][1023]) - int(s[c][1022]))));
+    }
+    return ret;
+}
+bool atrac_decode_call(Spu& sp) {
+    const uint32_t in = sp.r[3].w(0) & 0x3ffff, out = sp.r[4].w(0) & 0x3ffff, ctx = sp.r[7].w(0) & 0x3ffff;
+    const uint32_t flags = sp.lsw(ctx + 0x20);
+    int16_t s[AtracVoice::kMax][1028];
+    int n = 0;
+    const uint32_t ret = atrac_compute(in + 0x98u * uint32_t(atrac_channels(flags)) <= Spu::LS_SIZE ? sp.ls + in : nullptr, sp.lsw(ctx + 0x34), flags, s, n);
+    atrac_seq("ours", sp.lsw(ctx + 0x34), flags, sp.ls + in, ret);
+    {   // the result block the module leaves at r8 + 0x8d0 (the mixer reads it): r3's words, then the address of the last
+        // sound unit decoded and how many bits of it were read
+        const uint32_t res = (sp.r[8].w(0) + 0x8d0) & 0x3fff0;
+        const AtracVoice& v = *g_atracVoices[sp.lsw(ctx + 0x34)];
+        sp.lssw(res, ret); sp.lssw(res + 4, 2); sp.lssw(res + 8, 0x98); sp.lssw(res + 12, 0);
+        sp.lssw(res + 16, in + v.resUnit); sp.lssw(res + 20, v.resBits);
+    }
+    for (int c = 0; c < n; ++c) {   // channel c at r4 + c * 0x1000
+        uint32_t a = out + uint32_t(c) * 0x1000;
+        if (a + 1028 * 2 > Spu::LS_SIZE) continue;
+        for (int i = 0; i < 1028; ++i, a += 2) { sp.ls[a] = uint8_t(uint16_t(s[c][i]) >> 8); sp.ls[a + 1] = uint8_t(s[c][i]); }
+    }
+    if (const char* z = std::getenv("ATRACZERO")) {   // debug: clear (part of) the three buffers except our two outputs
+        const int m = std::atoi(z);
+        if (m & 1) std::memset(sp.ls + 0x12a00, 0, 0x8000);                       // r3 buffer (input + module scratch)
+        if (m & 2) { std::memset(sp.ls + 0x1b208, 0, 0x1ba00 - 0x1b208); std::memset(sp.ls + 0x1c208, 0, 0x22a00 - 0x1c208); }   // rest of r4
+        if (m & 4) std::memset(sp.ls + 0x22a00, 0, 0x8000);                       // r5 buffer
+    }
+    sp.r[3].sw(0, ret); sp.r[3].sw(1, 2); sp.r[3].sw(2, 0x98); sp.r[3].sw(3, 0);
+    sp.pc = sp.r[0].w(0) & 0x3fffc;
+    static uint64_t calls = 0, starts = 0, last = 0;
+    ++calls; if ((sp.lsw(ctx + 0x20) >> 24) == 2) ++starts;
+    static const uint64_t delayUs = std::getenv("ATRACDELAY") ? std::strtoull(std::getenv("ATRACDELAY"), nullptr, 10) : 0;   // debug: busy wait per call
+    if (delayUs) for (const uint64_t t0 = now_us(); now_us() - t0 < delayUs;) {}
+    if (std::getenv("ATRACSTAT") && now_us() - last > 4000000) {   // debug: ATRACSTAT=1
+        last = now_us();
+        for (auto& [k, vp] : g_atracVoices) if (vp->frames > 50) LOG("[atrac]   voice %08x %d ch: %.1f frames/s, %.1f calls/s%c", k, vp->nch, vp->frames * 1e6 / double(now_us() - vp->firstUs), vp->calls * 1e6 / double(now_us() - vp->firstUs), 10);
+        LOG("[atrac] built-in: %llu calls, %llu frames, %llu starts, %zu voices, bad %llu%c", (unsigned long long)calls, (unsigned long long)g_atracFrames.load(), (unsigned long long)starts, g_atracVoices.size(), (unsigned long long)g_atracBad.load(), 10);
+    }
+    return true;
+}
+// ATRACCHECK=1 (debug): the system's module decodes as usual; after each decode call ours computes the same call and
+// the outputs are compared ([atrac] lines every 4 s: calls, samples off by more than 2, worst difference)
+std::atomic<uint64_t> g_chkCalls{0}, g_chkBadSamples{0}, g_chkWorst{0}, g_chkRet{0}, g_chkRes{0};
+uint32_t g_chkCtx[32], g_chkRegs[3], g_chkIn[128][4];
+std::vector<uint8_t> g_chkLs(Spu::LS_SIZE);   // LS at the entry of the call (ATRACUNDO)
+
 void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, uint32_t spurs) {
     ripprof_register_thread("sndtask");
     if (!std::getenv("SNDNOPRIO")) host_thread_priority_high();
@@ -1510,6 +1931,187 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
     const spurt::Compiled* cpMod = std::getenv("NOSPUREC") ? nullptr : spurt::find_compiled(0xbce880);   // mstream_dsp_reverb.pic
     if (cpMain && !std::memcmp(s.ls + cpMain->lsBase, G->mem + cpMain->eaBin, cpMain->size)) { s.compiled = cpMain->fn; s.compiledLo = cpMain->lsBase; s.compiledHi = cpMain->lsBase + cpMain->size; }
     if (std::getenv("SNDTRACE")) s.mfcTrace = 4000;
+    if (std::getenv("ATRACHLE")) {   // debug: ATRACHLE=1 uses our decoder even when the system's module is loaded (A/B tests)
+        s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
+        s.onRegion3 = [](Spu& sp, bool enter) { return enter && sp.pc == 0x36c58 && atrac_decode_call(sp); };
+    }
+    if (std::getenv("ATRACCHECK")) {
+        s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
+        s.onRegion3 = [](Spu& sp, bool enter) {
+            static uint32_t out = 0, key = 0, phase = 0; static bool decoding = false; static uint8_t frame[0x98 * AtracVoice::kMax];
+            if (enter) {
+                decoding = sp.pc == 0x36c58;
+                static const bool noPut = std::getenv("ATRACNOPUT") != nullptr;   // debug: the module's writes to main memory are dropped
+                sp.dropPuts = noPut && decoding;
+                const uint32_t in = sp.r[3].w(0) & 0x3ffff;
+                out = sp.r[4].w(0) & 0x3ffff; key = sp.lsw((sp.r[7].w(0) & 0x3ffff) + 0x34); phase = sp.lsw((sp.r[9].w(0) & 0x3ffff) + 0x10);
+                if (in + sizeof frame <= Spu::LS_SIZE) std::memcpy(frame, sp.ls + in, sizeof frame);
+                for (int i = 0; i < 32; ++i) g_chkCtx[i] = sp.lsw((sp.r[7].w(0) & 0x3ffff) + 4 * i);
+                g_chkRegs[0] = in; g_chkRegs[1] = out; g_chkRegs[2] = sp.r[5].w(0);
+                {   // ATRACCTX=1: for the first decode calls of each voice, its context in main memory and the module's DMA
+                    static std::map<uint32_t, int> seen;
+                    if (decoding && std::getenv("ATRACCTX") && seen[key]++ < 2) {
+                        LOG("[ctxmem] voice %08x main memory:", key);
+                        for (int i = 0; i < 48; ++i) LOG(" %08x", be32(key + 4 * i));
+                        LOG("%c", 10);
+                        sp.mfcTrace = 8;
+                    }
+                }
+                for (int r = 0; r < 128; ++r) for (int w = 0; w < 4; ++w) g_chkIn[r][w] = sp.r[r].w(w);
+                std::memcpy(g_chkLs.data(), sp.ls, Spu::LS_SIZE);
+                return false;
+            }
+            sp.dropPuts = false;
+            if (!decoding) return false;
+            decoding = false;
+            int16_t s[AtracVoice::kMax][1028];
+            int nch = 0;
+            const uint32_t ourRet = atrac_compute(frame, key, g_chkCtx[8], s, nch);
+            if (sp.r[3].w(0) != ourRet) ++g_chkRet;
+            {
+                const AtracVoice& v = *g_atracVoices[key];
+                const uint32_t res = (g_chkIn[8][0] + 0x8d0) & 0x3fff0;
+                if (sp.lsw(res + 16) != g_chkRegs[0] + v.resUnit || sp.lsw(res + 20) != v.resBits) {
+                    ++g_chkRes;
+                    static int shownRes = 0;
+                    if (shownRes++ < 6) LOG("[atrac] result block differs: sony %05x %x, ours %05x %x (%d ch)%c", sp.lsw(res + 16), sp.lsw(res + 20), g_chkRegs[0] + v.resUnit, v.resBits, nch, 10);
+                }
+            }
+            atrac_seq("sony", key, g_chkCtx[8], frame, sp.r[3].w(0));
+            uint64_t bad = 0, worst = 0;
+            for (int c = 0; c < nch; ++c)
+                for (int i = 0; i < 1028; ++i) {
+                    const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                    const int16_t sony = int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1]);
+                    const uint64_t d = uint64_t(std::abs(int(sony) - int(s[c][i])));
+                    if (d > 2) ++bad;
+                    if (d > worst) worst = d;
+                }
+            {   // where Sony's decoder restarts a voice (0x200 twice in a row): the context words of that call
+                static std::map<uint32_t, uint32_t> lastRet; static int shownRestart = 0;
+                const uint32_t r = sp.r[3].w(0);
+                auto it = lastRet.find(key);
+                const bool restart = r == 0x200 && (it == lastRet.end() || it->second == 0x200);
+                static std::map<uint32_t, int> follow;   // calls still to show after a start flag (ctx word 8, top byte 2)
+                if ((g_chkCtx[8] >> 24) == 2 && shownRestart < 6) { ++shownRestart; follow[key] = 7; }
+                if (follow[key] > 0) {
+                    --follow[key];
+                    LOG("[atrac] seq voice %08x w8 %08x phase %u sony r3 %x %x %x %x, frame %02x%02x, ours bad %llu, regs r3 %05x r4 %05x r5 %05x%c", key, g_chkCtx[8], phase,
+                        sp.r[3].w(0), sp.r[3].w(1), sp.r[3].w(2), sp.r[3].w(3), frame[0], frame[1], (unsigned long long)bad, g_chkRegs[0], g_chkRegs[1], g_chkRegs[2], 10);
+                }
+                (void)restart;
+                lastRet[key] = r;
+            }
+            {   // registers the module changes besides r3 (the first calls): the mixer may read more than r3
+                static int shownRegs = 0;
+                if (shownRegs < 6) {
+                    ++shownRegs;
+                    LOG("[atrac] regs changed by the module (call %llu):", (unsigned long long)g_chkCalls.load());
+                    for (int r = 1; r < 128; ++r)
+                        for (int w = 0; w < 4; ++w)
+                            if (sp.r[r].w(w) != g_chkIn[r][w] && r != 3) { LOG(" r%d.%d %08x->%08x", r, w, g_chkIn[r][w], sp.r[r].w(w)); break; }
+                    LOG("%c", 10);
+                }
+            }
+            {   // which 0x1000 blocks of the three buffers the module writes, for 2- and 6-channel voices
+                static int shown2 = 0, shown6 = 0;
+                const int chans = int((g_chkCtx[8] >> 16) & 0xff);
+                int& shown = chans == 6 ? shown6 : shown2;
+                static int dumped6 = 0;   // the local store before and after a few 6-channel calls -> atrac6_<n>_in/out.bin
+                if (chans == 6 && (g_chkCtx[8] >> 24) == 1 && dumped6 < 6) {
+                    char name[48];
+                    std::snprintf(name, sizeof name, "atrac6_%d_in.bin", dumped6);
+                    if (FILE* f = std::fopen(name, "wb")) { std::fwrite(g_chkLs.data(), 1, Spu::LS_SIZE, f); std::fclose(f); }
+                    std::snprintf(name, sizeof name, "atrac6_%d_out.bin", dumped6);
+                    if (FILE* f = std::fopen(name, "wb")) { std::fwrite(sp.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
+                    ++dumped6;
+                }
+                static int shownR5 = 0;
+                bool r5w = false;
+                for (uint32_t b = 0x1b208; b < 0x2aa00 && !r5w; ++b) if ((b < 0x1ba00 || b >= 0x1c208) && sp.ls[b] != g_chkLs[b]) r5w = true;
+                if (shown < 3 || (r5w && shownR5 < 10)) {
+                    ++shown; if (r5w) ++shownR5;
+                    LOG("[atrac] %d-ch voice %08x flags %08x ret %x writes outside the 2 outputs:", chans, key, g_chkCtx[8], sp.r[3].w(0));
+                    for (uint32_t b = 0x1b208; b < 0x2aa00;) {
+                        if ((b >= 0x1ba00 && b < 0x1c208) || sp.ls[b] == g_chkLs[b]) { ++b; continue; }
+                        uint32_t e = b; while (e < 0x2aa00 && (sp.ls[e] != g_chkLs[e] || (e + 8 < 0x2aa00 && std::memcmp(sp.ls + e, g_chkLs.data() + e, 8)))) ++e;
+                        LOG(" %05x-%05x", b, e); b = e;
+                    }
+                    const uint32_t a = 0x23a00;
+                    LOG(" | 23a00: %04x %04x %04x %04x%c", uint32_t(sp.ls[a]) << 8 | sp.ls[a + 1], uint32_t(sp.ls[a + 2]) << 8 | sp.ls[a + 3], uint32_t(sp.ls[a + 4]) << 8 | sp.ls[a + 5], uint32_t(sp.ls[a + 6]) << 8 | sp.ls[a + 7], 10);
+                }
+            }
+            {   // ATRACR8=1: words of the mixer's area (r8 = 0x3c200 .. 0x3d200) the module changes, for the first calls
+                static int shownR8 = 0;
+                static uint32_t follow = 0;
+                if (std::getenv("ATRACR8") && shownR8 >= 24 && shownR8 < 90 && (follow == 0 || follow == key)) {   // one voice in a row: the result block
+                    follow = key; ++shownR8;
+                    LOG("[r8seq] flags %08x in %05x r8 %05x ret %x | 3cad0:", g_chkCtx[8], g_chkRegs[0], g_chkIn[8][0], sp.r[3].w(0));
+                    for (uint32_t a = 0x3cad0; a < 0x3caf0; a += 4) LOG(" %08x", sp.lsw(a));
+                    LOG(" | frame %02x%02x%02x%02x%c", frame[0], frame[1], frame[2], frame[3], 10);
+                }
+                if (std::getenv("ATRACR8") && shownR8 < 24) {
+                    ++shownR8;
+                    LOG("[r8] voice %08x ret %x:", key, sp.r[3].w(0));
+                    for (uint32_t a = 0x3c200; a < 0x3d200; a += 4) {
+                        const uint32_t before = uint32_t(g_chkLs[a]) << 24 | uint32_t(g_chkLs[a + 1]) << 16 | uint32_t(g_chkLs[a + 2]) << 8 | g_chkLs[a + 3];
+                        if (before != sp.lsw(a)) LOG(" %05x:%08x->%08x", a, before, sp.lsw(a));
+                    }
+                    LOG("%c", 10);
+                }
+            }
+            static int shownBig = 0;
+            if (worst > 1000 && shownBig++ < 8) {
+                int at = 0, cc = 0, so = 0, us = 0;
+                for (int c = 0; c < nch; ++c)
+                    for (int i = 0; i < 1028; ++i) {
+                        const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                        const int sv = int(int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1]));
+                        if (std::abs(sv - int(s[c][i])) == int(worst)) { at = i; cc = c; so = sv; us = s[c][i]; }
+                    }
+                LOG("[atrac] big diff %llu voice %08x flags %08x sony ret %x ours %x, ch %d sample %d sony %d ours %d, bad %llu, frame %02x%02x%c", (unsigned long long)worst, key, g_chkCtx[8],
+                    sp.r[3].w(0), ourRet, cc, at, so, us, (unsigned long long)bad, frame[0], frame[1], 10);
+            }
+            static int shownDetail = 0;
+            if (bad > 100 && (g_chkCtx[8] >> 24) == 2 && shownDetail++ < 2) {   // a start call that differs: both outputs, sampled
+                LOG("[atrac] start detail voice %08x:", key);
+                for (int c = 0; c < nch; ++c)
+                    for (int i = 0; i < 1028; i += 64) {
+                        const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                        LOG(" c%d[%d] %d/%d", c, i, int(int16_t(uint16_t(sp.ls[a]) << 8 | sp.ls[a + 1])), int(s[c][i]));
+                    }
+                LOG("%c", 10);
+            }
+            static int shownBad = 0;
+            if ((bad > 100 || sp.r[3].w(0) != ourRet) && shownBad++ < 16)
+                LOG("[atrac] mismatch: voice %08x phase %u sony r3 %08x %08x %08x %08x, bad %llu, frame %02x%02x%02x%02x, regs r4 %05x r5 %05x r6 %x r8 %05x%c", key, phase,
+                    sp.r[3].w(0), sp.r[3].w(1), sp.r[3].w(2), sp.r[3].w(3), (unsigned long long)bad, frame[0], frame[1], frame[2], frame[3], sp.r[4].w(0), sp.r[5].w(0), sp.r[6].w(0), sp.r[8].w(0), 10);
+            {   // ATRACUNDO=lo-hi (hex LS range): put back what that range held before Sony's call (which of its writes matter)
+                static uint32_t ulo = 0, uhi = 0;
+                static bool parsed = false;
+                if (!parsed) { parsed = true; if (const char* u = std::getenv("ATRACUNDO")) std::sscanf(u, "%x-%x", &ulo, &uhi); }
+                if (uhi > ulo && uhi <= Spu::LS_SIZE) std::memcpy(sp.ls + ulo, g_chkLs.data() + ulo, uhi - ulo);
+            }
+            if (std::getenv("ATRACREGS"))   // debug: registers back to their entry values except r3 (does the mixer read others?)
+                for (int r = 2; r < 128; ++r) if (r != 3) for (int w = 0; w < 4; ++w) sp.r[r].sw(w, g_chkIn[r][w]);
+            static const bool overwrite = std::getenv("ATRACCHECK")[0] == '2';   // ATRACCHECK=2: then replace Sony's output by ours
+            if (overwrite)
+                for (int c = 0; c < nch; ++c)
+                    for (int i = 0; i < 1028; ++i) {
+                        const uint32_t a = (out + uint32_t(c) * 0x1000 + uint32_t(i) * 2) & (Spu::LS_SIZE - 2);
+                        sp.ls[a] = uint8_t(uint16_t(s[c][i]) >> 8); sp.ls[a + 1] = uint8_t(s[c][i]);
+                    }
+            ++g_chkCalls; g_chkBadSamples += bad;
+            if (worst > g_chkWorst) g_chkWorst = worst;
+            static uint64_t last = 0;
+            if (now_us() - last > 4000000) {
+                last = now_us();
+                LOG("[atrac] check: %llu calls, %llu samples off by more than 2, worst %llu, wrong return %llu, wrong result block %llu, voices %zu, bad frames %llu%c", (unsigned long long)g_chkCalls.load(),
+                    (unsigned long long)g_chkBadSamples.load(), (unsigned long long)g_chkWorst.load(), (unsigned long long)g_chkRet.load(), (unsigned long long)g_chkRes.load(), g_atracVoices.size(), (unsigned long long)g_atracBad.load(), 10);
+            }
+            return false;
+        };
+    }
     if (const char* cl = std::getenv("CODECLOG")) {   // debug: CODECLOG=n: the first n calls into the music decoder (LS 0x32980..), arguments and result
         static int left = std::atoi(cl);
         s.region3Lo = 0x32980; s.region3Hi = 0x32980 + 0x7d40;
@@ -1525,6 +2127,16 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                 char name[64]; std::snprintf(name, sizeof name, "codec_%03d_%s.bin", k, enter ? "in" : "out");
                 if (FILE* f = std::fopen(name, "wb")) { std::fwrite(sp.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
             }
+            // CODECMFC=first,n: the DMA commands the decoder issues during those calls, with its stream context words
+            static int mf = -1, mn = 0;
+            if (mf < 0) { mf = 1 << 30; if (const char* d = std::getenv("CODECMFC")) std::sscanf(d, "%d,%d", &mf, &mn); }
+            if (k >= mf && k < mf + mn) {
+                if (enter) {
+                    LOG("[codec] call %d ctx r7:", k); for (int i = 0; i < 24; ++i) LOG(" %08x", sp.lsw(0x2eb80 + 4 * i)); LOG("%c", 10);
+                    LOG("[codec] call %d r9:", k); for (int i = 0; i < 24; ++i) LOG(" %08x", sp.lsw(0x2ea80 + 4 * i)); LOG("%c", 10);
+                    sp.mfcTrace = 200;
+                } else sp.mfcTrace = 0;
+            }
             if (!enter) ++k;
             return false;
         };
@@ -1535,12 +2147,16 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
         const uint32_t nr = sp.r[3].w(0), lr = sp.r[0].w(0);
         { static std::set<uint64_t> seen; if (seen.size() < 24 && seen.insert(uint64_t(tg) << 40 | uint64_t(lr) << 8 | (nr & 0xff)).second) LOG("[snd] task %u: first call of LS 0x%x from %05x with r3 %08x%c", t->id, tg, lr, nr, 10); }
         if (trace && shown++ < 200) LOG("[snd] task %u: call LS 0x%x r3 %08x r4 %08x r5 %08x lr %05x\n", t->id, tg, nr, sp.r[4].w(0), sp.r[5].w(0), lr);
-        if (tg == 0) {   // codec module that was never loaded (flashATRAC.pic missing): the stream stays silent
+        if (tg == 0) {   // codec module that was never loaded (no flashATRAC.pic): our own ATRAC3 decoder answers the calls
             static bool told = false;
-            if (!told) { told = true; LOG("[snd] no ATRAC decoder (dev_flash/sys/external/flashATRAC.pic): music streams are silent%c", 10); }
+            if (!told) { told = true; LOG("[snd] no flashATRAC.pic: music and ambience streams use the built-in ATRAC3 decoder%c", 10); }
             ++g_passes;
-            std::memset(sp.ls + 0x12a00, 0, 0x18000);   // the three work buffers the decoder is given: compressed data must not be mixed as PCM
             { const uint64_t d = now_us() - g_wake; g_busySum += d; ++g_waits; if (d > g_busyMax) g_busyMax = d; if (d > 8000) ++g_slow; }   // debug: time since the last signal
+            if (sp.r[6].w(0) == 0x400) {   // decode
+                atrac_decode_call(sp);
+                if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; }
+                return true;
+            }
             if (cpMod && !sp.compiled2 && !std::memcmp(sp.ls + cpMod->lsBase, G->mem + cpMod->eaBin, cpMod->size)) { sp.compiled2 = cpMod->fn; sp.compiled2Lo = cpMod->lsBase; sp.compiled2Hi = cpMod->lsBase + cpMod->size; }
             sp.r[3].sw(0, 0); sp.pc = lr & 0x3fffc;
             return true;
@@ -1548,7 +2164,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
         if (tg != 0xA70) { LOG("[snd] task %u branched to LS 0x%x (r3 %08x lr %05x): not handled; LS 2ee50 = %08x %08x %08x %08x\n", t->id, tg, nr, lr, sp.lsw(0x2ee50), sp.lsw(0x2ee54), sp.lsw(0x2ee58), sp.lsw(0x2ee5c)); return false; }
         switch (nr) {
             case 0: LOG("[snd] task %u exited\n", t->id); return false;     // exit
-            case 1: std::this_thread::yield(); sp.r[3].sw(0, 0); break;         // yield
+            case 1: ++g_sndSys[1]; std::this_thread::yield(); sp.r[3].sw(0, 0); break;         // yield
             case 2: {                                                           // wait signal
                 const uint64_t t0 = now_us();
                 if (g_wake) { const uint64_t busy = t0 - g_wake; g_busySum += busy; if (busy > g_busyMax) g_busyMax = busy; ++g_waits; }
@@ -1568,7 +2184,7 @@ void run_task(Task* t, uint32_t elf, uint64_t a0, uint64_t a1, uint64_t tsArgs, 
                 sp.r[3].sw(0, 0);
                 break;
             }
-            case 3: sp.r[3].sw(0, 0); break;                                    // poll: nothing else wants this SPU
+            case 3: ++g_sndSys[3]; sp.r[3].sw(0, 0); break;                                    // poll: nothing else wants this SPU
             default: LOG("[snd] task %u: SPURS task syscall %u not handled\n", t->id, nr); return false;
         }
         sp.pc = lr & 0x3fffc;
@@ -1619,7 +2235,9 @@ constexpr uint32_t kUnwritten = 0x7fc0dead;
 std::atomic<uint64_t> g_holes{0}, g_waited{0};
 void port_thread() {
     // The game waits for its mixer even with the sound off: the port then runs on its clock and nothing is played.
-    const bool play = settings().sound && !std::getenv("NOSOUND") && audio_out_open();
+    // settings().sound is followed while the game runs (options menu): the device is opened the first time it is on
+    static const bool noSound = std::getenv("NOSOUND") != nullptr;
+    bool play = settings().sound && !noSound && audio_out_open(), openFailed = settings().sound && !noSound && !play;
     host_thread_priority_high();
     LOG("[snd] audio port %s: %u channels, %u blocks\n", play ? "playing" : "running silent (sound off)", g_ch, g_blocks);
     std::vector<float> out(512);
@@ -1630,6 +2248,11 @@ void port_thread() {
         // index and must see it advance evenly (bursts make it miss blocks). The SDL queue absorbs the jitter; the
         // clock is nudged to keep about 6 blocks queued, which also follows the sound card's real rate.
         next += std::chrono::nanoseconds(5333333);
+        if (const bool want = settings().sound && !noSound; want != play && !(want && openFailed)) {
+            if (want) { play = audio_out_open(); openFailed = !play; }
+            else { play = false; audio_out_clear(); }
+            LOG("[snd] sound %s\n", play ? "on" : "off");
+        }
         {
             const int q = play ? audio_out_queued() : 12 * 256;
             if (q > 16 * 256) next += std::chrono::microseconds(300); else if (q < 10 * 256) next -= std::chrono::microseconds(300);   // about 70 ms queued: room for a late mixer pass when another program (OBS) takes CPU time
@@ -1674,6 +2297,7 @@ void port_thread() {
         gcm::wr(g_readIdx + 4, (idx + 1) % g_blocks);
         if (++blocksOut % 1875 == 0) {
             LOG("[snd] 10 s of audio played, peak level %.3f, %llu signals\n", peak, (unsigned long long)g_signals.load()); peak = 0;
+            LOG("[snd]   task syscalls in 10 s: yield %llu, poll %llu\n", (unsigned long long)g_sndSys[1].exchange(0), (unsigned long long)g_sndSys[3].exchange(0));
             LOG("[snd]   %llu codec calls, main %s, module %s%c", (unsigned long long)g_passes.load(), !g_tasks.empty() && g_tasks[0]->spu.compiled ? "recompiled" : "interpreted", !g_tasks.empty() && g_tasks[0]->spu.compiled2 ? "recompiled" : "interpreted", 10);
             if (std::getenv("SNDDUMP") && blocksOut == 1875 && !g_tasks.empty()) if (FILE* f = std::fopen("snd_ls.bin", "wb")) { std::fwrite(g_tasks[0]->spu.ls, 1, Spu::LS_SIZE, f); std::fclose(f); }
             { const uint64_t w = g_waits.exchange(0), bs = g_busySum.exchange(0), bm = g_busyMax.exchange(0); LOG("[snd]   codec calls: %.2f ms after the signal on average, %.2f ms at most, %llu over 8 ms%c", w ? bs / 1000.0 / w : 0.0, bm / 1000.0, (unsigned long long)g_slow.exchange(0), 10); LOG("[snd]   blocks waited for: %llu, played as holes: %llu, %d frames queued%c", (unsigned long long)g_waited.exchange(0), (unsigned long long)g_holes.exchange(0), audio_out_queued(), 10); }
@@ -1814,8 +2438,13 @@ bool imports(PPU& c, const char* module, const char* name) {
             for (int k = 0; k < 4; ++k)
                 if (cbs[k].first) call_nested(c, cbs[k].first, uint32_t(c.r[1]) - 0x800, ev.first, ev.second, cbs[k].second);
         }
+        if (netplay::enabled())   // online play: the game's NP callbacks (requests, room events, signaling) run here, as on the PS3
+            for (const auto& cb : netplay::take_callbacks())
+                call_nested(c, cb.opd, uint32_t(c.r[1]) - 0x800, cb.a[0], cb.a[1], cb.a[2], cb.a[3], cb.a[4], cb.a[5], cb.a[6], cb.a[7]);
         ret(c, CELL_OK); return true;
     }
+    if ((n == "_sys_net_errno_loc" || n == "sys_net_errno_loc") && netplay::enabled()) { static const uint32_t e = alloc_user(16, 16); netplay::set_errno_addr(e); ret(c, e); return true; }
+    if (n != "cellNetCtlNetStartDialogLoadAsync" && n != "cellNetCtlNetStartDialogUnloadAsync" && netplay::hle(c, module, n)) return true;   // NETPLAY: online play
     // --- network: no connection (as a console without network): the start dialog finishes with "not connected"
     if (n == "cellNetCtlNetStartDialogLoadAsync") {
         std::lock_guard<std::mutex> lk(g_sysutilMx);
@@ -1824,7 +2453,7 @@ bool imports(PPU& c, const char* module, const char* name) {
         ret(c, CELL_OK); return true;
     }
     if (n == "cellNetCtlNetStartDialogUnloadAsync") {   // (CellNetCtlNetStartDialogResult* {u32 size; s32 result})
-        if (a32(c, 0)) c.wr32(a32(c, 0) + 4, 0x80130106u);   // CELL_NET_CTL_ERROR_NET_NOT_CONNECTED
+        if (a32(c, 0)) c.wr32(a32(c, 0) + 4, netplay::enabled() ? 0u : 0x80130106u);   // connected (online play) or CELL_NET_CTL_ERROR_NET_NOT_CONNECTED
         std::lock_guard<std::mutex> lk(g_sysutilMx);
         g_sysutilEv.push_back({0x0803, 0});   // CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED
         ret(c, CELL_OK); return true;
@@ -1837,6 +2466,154 @@ bool imports(PPU& c, const char* module, const char* name) {
     if (n == "cellSaveDataAutoLoad2") { ret(c, savedata::op(c, false)); return true; }
     if (n == "cellSaveDataAutoSave2") { ret(c, savedata::op(c, true)); return true; }
     if (n == "cellSaveDataListLoad2") { ret(c, savedata::ERR_NODATA); return true; }
+    // --- trophies (sceNpTrophy): the game's own list (TROPDIR/*/TROPHY.TRP next to USRDIR, in the game's language),
+    //     unlocked ones kept in dev_hdd0/trofeos.txt; an unlock shows a notification on screen
+    if (n.rfind("sceNpTrophy", 0) == 0) {
+        struct Trophy { int id; char type; std::wstring name, detail; std::string icon; };
+        static std::vector<Trophy> list;
+        static std::set<int> unlocked;
+        static bool loaded = false;
+        static const std::string savePath = CFG.hdd0 + "/trofeos.txt";
+        if (!loaded) {
+            loaded = true;
+            std::error_code ec;
+            for (const auto& d : std::filesystem::directory_iterator(std::filesystem::path(CFG.usrdir).parent_path() / "TROPDIR", ec)) {
+                FILE* f = _wfopen((d.path() / "TROPHY.TRP").wstring().c_str(), L"rb");
+                if (!f) continue;
+                std::vector<uint8_t> trp;
+                for (int ch; (ch = std::fgetc(f)) != EOF;) trp.push_back(uint8_t(ch));
+                std::fclose(f);
+                auto be = [&](size_t o, int bytes) { uint64_t v = 0; for (int i = 0; i < bytes && o + i < trp.size(); ++i) v = v << 8 | trp[o + i]; return v; };
+                auto entry = [&](const std::string& want) -> std::string {
+                    const uint32_t cnt = uint32_t(be(0x10, 4)), esz = uint32_t(be(0x14, 4));
+                    for (uint32_t i = 0; i < cnt && 0x40 + (i + 1) * esz <= trp.size(); ++i) {
+                        const size_t o = 0x40 + size_t(i) * esz;
+                        if (std::string(reinterpret_cast<const char*>(&trp[o])) != want) continue;
+                        const uint64_t off = be(o + 32, 8), sz = be(o + 40, 8);
+                        if (off + sz <= trp.size()) return std::string(reinterpret_cast<const char*>(&trp[off]), size_t(sz));
+                    }
+                    return {};
+                };
+                static const char* const langFile[6] = {"TROP.SFM", "TROP_01.SFM", "TROP_02.SFM", "TROP_03.SFM", "TROP_04.SFM", "TROP_05.SFM"};
+                std::string xml = entry(langFile[std::clamp(settings().language, 0, 5)]);
+                if (xml.empty()) xml = entry("TROP.SFM");
+                auto wide = [](const std::string& s) {   // UTF-8, or Latin-1 when it is not valid UTF-8
+                    std::wstring w; bool ok = true;
+                    for (size_t i = 0; i < s.size() && ok;) {
+                        const unsigned char c = uint8_t(s[i]);
+                        int len = c < 0x80 ? 1 : (c >> 5) == 6 ? 2 : (c >> 4) == 14 ? 3 : 0;
+                        if (!len || i + len > s.size()) { ok = false; break; }
+                        uint32_t cp = len == 1 ? c : len == 2 ? c & 31 : c & 15;
+                        for (int k = 1; k < len; ++k) { if ((uint8_t(s[i + k]) >> 6) != 2) { ok = false; break; } cp = cp << 6 | (uint8_t(s[i + k]) & 63); }
+                        w += wchar_t(cp); i += size_t(len);
+                    }
+                    if (!ok) { w.clear(); for (unsigned char c : s) w += wchar_t(c); }
+                    return w;
+                };
+                auto trim = [](std::wstring s) { while (!s.empty() && (s.back() == L' ' || s.back() == L'\n' || s.back() == L'\r')) s.pop_back(); return s; };
+                for (size_t p = 0; (p = xml.find("<trophy ", p)) != std::string::npos; ++p) {
+                    const size_t end = xml.find("</trophy>", p);
+                    if (end == std::string::npos) break;
+                    const std::string t = xml.substr(p, end - p);
+                    auto attr = [&](const char* a) { const size_t q = t.find(std::string(a) + "=\""); return q == std::string::npos ? std::string() : t.substr(q + std::strlen(a) + 2, t.find('"', q + std::strlen(a) + 2) - q - std::strlen(a) - 2); };
+                    auto tag = [&](const char* g) { const size_t q = t.find(std::string("<") + g + ">"); if (q == std::string::npos) return std::string(); const size_t s0 = q + std::strlen(g) + 2; return t.substr(s0, t.find("</", s0) - s0); };
+                    const std::string ty = attr("ttype");
+                    list.push_back({std::atoi(attr("id").c_str()), ty.empty() ? 'B' : ty[0], trim(wide(tag("name"))), trim(wide(tag("detail"))), {}});
+                    { char ic[16]; std::snprintf(ic, sizeof ic, "TROP%03d.PNG", list.back().id); list.back().icon = entry(ic); }
+                }
+                break;
+            }
+            if (FILE* f = std::fopen(savePath.c_str(), "r")) { for (int id; std::fscanf(f, "%d%*[^\n]", &id) == 1;) unlocked.insert(id); std::fclose(f); }
+            LOG("[trophy] %zu trophies, %zu unlocked%c", list.size(), unlocked.size(), 10);
+            if (std::getenv("TROPHYTEST") && !list.empty())   // debug: the notification of a trophy (not unlocked)
+                for (const auto& t : list) if (t.id == std::atoi(std::getenv("TROPHYTEST"))) rsx::toast(L"Trofeo desbloqueado", t.name, t.detail, t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u, t.icon);
+        }
+        auto find = [&](int id) -> const Trophy* { for (const auto& t : list) if (t.id == id) return &t; return nullptr; };
+        if (n == "sceNpTrophyCreateContext" || n == "sceNpTrophyCreateHandle") { if (a32(c, 0)) c.wr32(a32(c, 0), 1); ret(c, CELL_OK); return true; }
+        if (n == "sceNpTrophyGetTrophyUnlockState") {   // (ctx, handle, SceNpTrophyFlagArray* {u32 flag_bits[4]}, u32* count)
+            const uint32_t fl = a32(c, 2);
+            if (fl) { for (int i = 0; i < 4; ++i) c.wr32(fl + 4 * i, 0); for (int id : unlocked) if (id >= 0 && id < 128) c.wr32(fl + 4 * (id >> 5), c.rd32(fl + 4 * (id >> 5)) | 1u << (id & 31)); }
+            if (a32(c, 3)) c.wr32(a32(c, 3), uint32_t(list.size()));
+            ret(c, CELL_OK); return true;
+        }
+        if (n == "sceNpTrophyGetTrophyInfo") {   // (ctx, handle, id, SceNpTrophyDetails* {s32 id, u32 grade, char name[128], char desc[1024], u8 hidden}, SceNpTrophyData*)
+            const int id = int(a32(c, 2));
+            const Trophy* t = find(id);
+            if (const uint32_t d = a32(c, 3)) {
+                std::memset(c.mem + d, 0, 4 + 4 + 128 + 1024 + 4);
+                c.wr32(d, uint32_t(id));
+                c.wr32(d + 4, t ? (t->type == 'P' ? 1u : t->type == 'G' ? 2u : t->type == 'S' ? 3u : 4u) : 0u);
+                if (t) {
+                    auto put = [&](uint32_t a, const std::wstring& w, size_t cap) { std::string u; for (wchar_t ch : w) { if (ch < 0x80) u += char(ch); else if (ch < 0x800) { u += char(0xC0 | (ch >> 6)); u += char(0x80 | (ch & 63)); } else { u += char(0xE0 | (ch >> 12)); u += char(0x80 | ((ch >> 6) & 63)); u += char(0x80 | (ch & 63)); } } std::memcpy(c.mem + a, u.data(), std::min(u.size(), cap - 1)); };
+                    put(d + 8, t->name, 128); put(d + 136, t->detail, 1024);
+                }
+            }
+            if (const uint32_t d = a32(c, 4)) { std::memset(c.mem + d, 0, 16); c.wr32(d + 8, uint32_t(id)); c.wr8(d + 12, unlocked.count(id) ? 1 : 0); }
+            ret(c, t ? CELL_OK : 0x8002290du /* SCE_NP_TROPHY_ERROR_INVALID_TROPHY_ID */); return true;
+        }
+        if (n == "sceNpTrophyUnlockTrophy") {   // (ctx, handle, id, s32* platinumId)
+            const int id = int(a32(c, 2));
+            if (a32(c, 3)) c.wr32(a32(c, 3), 0xFFFFFFFFu);   // no platinum unlocked by this
+            auto unlock = [&](const Trophy& t) {
+                unlocked.insert(t.id);
+                if (FILE* f = std::fopen(savePath.c_str(), "a")) { std::fprintf(f, "%d %lld\n", t.id, (long long)std::time(nullptr)); std::fclose(f); }
+                static const wchar_t* const title[6] = {L"Trophy unlocked", L"Trophy unlocked", L"Trophée débloqué", L"Trofeo desbloqueado", L"Trophäe freigeschaltet", L"Trofeo sbloccato"};
+                const uint32_t rgb = t.type == 'P' ? 0x9FD6FFu : t.type == 'G' ? 0xFFC83Cu : t.type == 'S' ? 0xC8CDD4u : 0xCD7F32u;
+                rsx::toast(title[std::clamp(settings().language, 0, 5)], t.name, t.detail, rgb, t.icon);
+                LOG("[trophy] unlocked %d%c", t.id, 10);
+            };
+            const Trophy* t = find(id);
+            if (t && !unlocked.count(id)) {
+                unlock(*t);
+                // the platinum trophy, if there is one, comes with all the others
+                const Trophy* plat = nullptr; bool all = true;
+                for (const auto& x : list) { if (x.type == 'P') plat = &x; else if (!unlocked.count(x.id)) all = false; }
+                if (plat && all && !unlocked.count(plat->id)) { unlock(*plat); if (a32(c, 3)) c.wr32(a32(c, 3), uint32_t(plat->id)); }
+            }
+            ret(c, CELL_OK); return true;
+        }
+        ret(c, CELL_OK); return true;   // Init, Term, RegisterContext, Destroy*
+    }
+    // --- camera (cellCamera): the EyeToy features use a PlayStation Eye; here it is the host camera chosen in the menu
+    //     (host_camera.cpp). CellCameraInfoEx: format, resolution, framerate, buffer, bytesize, width, height, dev_num,
+    //     guid, info_ver, container, read_mode, pbuf[2]. The game opens it as RAW8 (Bayer), VGA, 60 fps.
+    if (n.rfind("cellCamera", 0) == 0) {
+        static uint32_t camFormat = 0, camW = 0, camH = 0, camBuf = 0, camBytes = 0;
+        { static int shown = 0; if (shown++ < 40) LOG("[camera] %s(%x, %x, %x) lr %llx%c", n.c_str(), a32(c, 0), a32(c, 1), a32(c, 2), (unsigned long long)c.lr, 10); }
+        if (n == "cellCameraInit" || n == "cellCameraEnd" || n == "cellCameraReset") { ret(c, CELL_OK); return true; }
+        // one camera, device 0 (the game looks for devices 0, 1, 2... until one is not attached)
+        const bool dev0 = a32(c, 0) == 0 && host_camera_available(settings().camera);
+        if (n == "cellCameraIsAttached") { ret(c, dev0 ? 1 : 0); return true; }
+        if (n == "cellCameraGetType") {   // CELL_CAMERA_EYETOY2 = the PlayStation Eye
+            if (a32(c, 1)) c.wr32(a32(c, 1), dev0 ? 2 : 0);
+            ret(c, dev0 ? CELL_OK : 0x80140808u); return true;
+        }
+        if (n == "cellCameraOpenEx") {
+            if (!dev0) { ret(c, 0x80140808u); return true; }   // CELL_CAMERA_ERROR_DEVICE_NOT_FOUND
+            const uint32_t p = a32(c, 1);
+            camFormat = c.rd32(p);
+            const uint32_t res = c.rd32(p + 4);
+            camW = res == 2 ? 320 : res == 4 ? c.rd32(p + 0x14) : 640;
+            camH = res == 2 ? 240 : res == 3 ? 360 : res == 4 ? c.rd32(p + 0x18) : 480;
+            const uint32_t bpp = camFormat == 5 ? 4 : camFormat == 3 ? 2 : 1;
+            camBytes = camW * camH * bpp;
+            static uint32_t ownBuf = 0, ownBytes = 0;   // allocated once, kept for later opens
+            camBuf = c.rd32(p + 0xc);
+            if (!camBuf) { if (ownBytes < camBytes) { ownBuf = alloc_user(camBytes, 0x100); ownBytes = camBytes; } camBuf = ownBuf; c.wr32(p + 0xc, camBuf); }
+            c.wr32(p + 0x10, camBytes); c.wr32(p + 0x14, camW); c.wr32(p + 0x18, camH);
+            LOG("[camera] open: format %u, %ux%u, %u fps, buffer %08x (%u bytes), read mode %u%c", camFormat, camW, camH, c.rd32(p + 8), camBuf, camBytes, c.rd32(p + 0x2c), 10);
+            ret(c, CELL_OK); return true;
+        }
+        if (n == "cellCameraStart") { ret(c, host_camera_start(settings().camera) ? CELL_OK : 0x80140808u /* CELL_CAMERA_ERROR_DEVICE_NOT_FOUND */); return true; }
+        if (n == "cellCameraRead") {   // (dev, u32* frame_num, u32* bytes_read): the latest image into the buffer given at open
+            uint32_t frame = 0, bytes = 0;
+            if (camBuf && camBytes) bytes = host_camera_read(G->mem + camBuf, camBytes, int(camFormat), int(camW), int(camH), frame);
+            if (a32(c, 1)) c.wr32(a32(c, 1), frame);
+            if (a32(c, 2)) c.wr32(a32(c, 2), bytes);
+            ret(c, CELL_OK); return true;
+        }
+        if (n == "cellCameraStop" || n == "cellCameraClose") { host_camera_stop(); ret(c, CELL_OK); return true; }
+    }
     // --- pad (sys_io): one DualShock 3 connected on port 0; buttons from the host pad state (pad_state())
     if (n == "cellPadInit" || n == "cellPadEnd" || n == "cellPadSetPortSetting") { ret(c, CELL_OK); return true; }
     if (n == "cellPadSetActDirect") {   // (port, CellPadActParam* {u8 motor[6]}): motor 0 = small (on/off), motor 1 = large (0..255)
@@ -1992,6 +2769,7 @@ bool imports(PPU& c, const char* module, const char* name) {
     // --- SPURS: the Edge Zlib inflate task is done on the host (same result as the SPU task), event flags polled
     if (n == "_cellSpursJobChainAttributeInitialize") {   // (attr, jmRev, sdkRev, u64* jobChainEntry, sizeJobDescriptor, maxGrabbedJob, prio*, maxContention, ...)
         g_jobChainEntry = a32(c, 3);
+        LOG("[spurs] %d SPU worker threads (%u hardware threads)\n", jobs::g_workers, std::thread::hardware_concurrency());
         LOG("[spurs] job chain attribute: command list 0x%x, job descriptor size %u, max grabbed %u, max contention %u (lr %llx)\n",
             g_jobChainEntry, a32(c, 4), a32(c, 5), a32(c, 7), (unsigned long long)c.lr);
         ret(c, CELL_OK); return true;
@@ -2131,6 +2909,10 @@ bool imports(PPU& c, const char* module, const char* name) {
         const char* mode = (fl & 0x3) == 0 ? "rb" : ((fl & 0x40) ? ((fl & 0x200) ? "w+b" : "a+b") : "r+b");
         FILE* f = std::fopen(hp.c_str(), mode);
         LOG("[fs] open %s%s\n", gp.c_str(), f ? "" : "  NOT FOUND");
+        if (const size_t k = gp.find("/sumotool/ps3/"); f && k != std::string::npos) {   // the screen the menus show now
+            const std::string rest = gp.substr(k + 14), dir = rest.substr(0, rest.find('/'));
+            if (rest == dir + "/" + dir + ".dat" && dir != "global" && dir != "popups" && dir != "numberplate") rsx::screen_loaded(dir);
+        }
         if (!f) { ret(c, LV2_ENOENT); return true; }
         std::lock_guard<std::mutex> lk(g_fsMx);
         const uint32_t fd = g_nextFd++;
@@ -2149,8 +2931,13 @@ bool imports(PPU& c, const char* module, const char* name) {
         { std::lock_guard<std::mutex> lk(g_fsMx); auto it = g_files.find(a32(c, 0)); if (it != g_files.end()) f = it->second.f; }
         if (!f) { ret(c, 0x80010009); return true; }
         const uint64_t tio = now_us();
+        const int64_t pos = _ftelli64(f);
         const size_t k = n == "cellFsRead" ? std::fread(c.mem + a32(c, 1), 1, size_t(c.r[5]), f) : std::fwrite(c.mem + a32(c, 1), 1, size_t(c.r[5]), f);
         if (g_loadLog && now_us() - tio > 3000) LOG("[load] thread %x: %s of %llu bytes took %.1f ms (flip %llu)%c", t_tid, n.c_str(), (unsigned long long)c.r[5], (now_us() - tio) / 1000.0, (unsigned long long)gcm::flips.load(), 10);
+        if (n == "cellFsRead" && pos >= 0) {   // menu screens: the button icons of the controller in use
+            std::string hp; { std::lock_guard<std::mutex> lk(g_fsMx); auto it = g_files.find(a32(c, 0)); if (it != g_files.end()) hp = it->second.path; }
+            glyphs_patch_read(hp, uint64_t(pos), c.mem + a32(c, 1), k);
+        }
         if (a32(c, 3)) c.wr64(a32(c, 3), k);
         ret(c, CELL_OK); return true;
     }

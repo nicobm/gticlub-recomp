@@ -27,6 +27,7 @@ void lv2_install(Guest& g, const Lv2Config& cfg);   // also installs the import 
 void lv2_dump_waits();   // what every guest thread is blocked in (debug)
 unsigned long long lv2_flip_count();   // flips executed by the RSX so far
 bool audio_out_open();   // audio_out.cpp: 48 kHz stereo float output
+void audio_out_clear();
 int audio_out_queued();
 void audio_out_push(const float* stereo, int frames);
 int lv2_run_main(Guest& g);                          // boots the game at the ELF entry; returns exit code

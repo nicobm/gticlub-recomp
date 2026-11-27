@@ -50,6 +50,7 @@ void Spu::mfcCommand(uint32_t cmd) {
             if (size) std::memcpy(ls + lsa, mem + ea, std::min(size, LS_SIZE - lsa));
             break;
         case 0x20: case 0x21: case 0x22:   // PUT(B/F)
+            if (dropPuts) { ++droppedPuts; break; }   // debug
             if (size) put_backwards(mem + ea, ls + lsa, std::min(size, LS_SIZE - lsa));
             break;
         case 0x44: case 0x45: case 0x46:   // GETL: list of {u32 size(+stall bit), u32 eal} at LS address EAL

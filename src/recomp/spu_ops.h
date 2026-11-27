@@ -35,6 +35,14 @@ inline __m128i V(const Q& q) { return _mm_loadu_si128(reinterpret_cast<const __m
 inline Q mk(__m128i v) { Q q; _mm_storeu_si128(reinterpret_cast<__m128i*>(q.w), v); return q; }
 // Q layout <-> SPU byte order (memory index i = SPU byte i); the shuffle is its own inverse
 inline __m128i swp(__m128i v) { return _mm_shuffle_epi8(v, _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12)); }
+// whole-quadword float helpers (tools/spu2cpp.py VEC templates); same results as the scalar f()/spu_mul forms
+inline __m128 PS(__m128i v) { return _mm_castsi128_ps(v); }
+inline __m128i IS(__m128 v) { return _mm_castps_si128(v); }
+inline __m128i vabs(__m128i v) { return _mm_and_si128(v, _mm_set1_epi32(0x7fffffff)); }
+inline __m128 vmul_spu(__m128 a, __m128 b) {   // spu_mul: a zero factor gives +0
+    const __m128 z = _mm_setzero_ps();
+    return _mm_andnot_ps(_mm_or_ps(_mm_cmpeq_ps(a, z), _mm_cmpeq_ps(b, z)), _mm_mul_ps(a, b));
+}
 inline __m128i iota16() { return _mm_setr_epi8(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); }
 
 inline Q ldq(const uint8_t* ls, uint32_t a) {
@@ -50,14 +58,15 @@ inline Q pref(uint32_t v) { Q q{}; q.w[0] = v; return q; }
 // position, so shufb needs no conversion: only the source index it selects is flipped (^ 3).
 inline Q shufb(const Q& a, const Q& bb, const Q& c) {
     const __m128i A = V(a), Bv = V(bb), C = V(c);
-    const __m128i idx = _mm_xor_si128(_mm_and_si128(C, _mm_set1_epi8(0x0f)), _mm_set1_epi8(3));
-    const __m128i fromB = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
-    __m128i res = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(Bv, idx), fromB);
-    // control bytes 10xxxxxx -> 0x00, 110xxxxx -> 0xFF, 111xxxxx -> 0x80
-    const __m128i isC0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(char(0xC0))), _mm_set1_epi8(char(0xC0)));
-    const __m128i isE0 = _mm_cmpeq_epi8(_mm_and_si128(C, _mm_set1_epi8(char(0xE0))), _mm_set1_epi8(char(0xE0)));
-    const __m128i spec = _mm_blendv_epi8(isC0, _mm_set1_epi8(char(0x80)), isE0);
-    return mk(_mm_blendv_epi8(res, spec, C));   // top bit of the control byte selects the special value
+    // pshufb looks at the low 4 bits only and gives 0 where the top bit is set, which is what the special control
+    // bytes need as a start. Byte k of the SPU register lives at offset k ^ 3 here, hence the xor.
+    const __m128i idx = _mm_xor_si128(C, _mm_set1_epi8(3));
+    // bit 4 (a or b) moved to the top bit of the same byte for blendv (16-bit shift: no bit crosses into a top bit)
+    const __m128i res = _mm_blendv_epi8(_mm_shuffle_epi8(A, idx), _mm_shuffle_epi8(Bv, idx), _mm_slli_epi16(C, 3));
+    // control bytes 10xxxxxx -> 0x00, 110xxxxx -> 0xFF, 111xxxxx -> 0x80: a table on the high nibble (0 below 0xC)
+    const __m128i lut = _mm_setr_epi8(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, char(0xFF), char(0xFF), char(0x80), char(0x80));
+    const __m128i spec = _mm_shuffle_epi8(lut, _mm_and_si128(_mm_srli_epi16(C, 4), _mm_set1_epi8(0x0f)));
+    return mk(_mm_or_si128(res, spec));
 }
 // cbd/chd/cwd/cdd family. The 16 x 4 possible masks are precomputed (in the Q layout): building one byte by byte
 // and reloading it as a vector stalls on store forwarding, and scalar code runs this for every load and store.

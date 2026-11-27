@@ -114,7 +114,12 @@ def gen_lines(code, base, size, slow, leaders):
             op4 = w >> 28
             rT, rc = (w >> 21) & 0x7f, w & 0x7f
             A, Bq, Cq = f'r[{ra}]', f'r[{rb}]', f'r[{rc}]'
-            if op4 == 0x8:
+            if op4 == 0x8 and VEC:
+                s = f'{{ const __m128i a = V({A}), b = V({Bq}), c = V({Cq}); r[{rT}] = mk(_mm_or_si128(_mm_andnot_si128(c, a), _mm_and_si128(b, c))); }}'
+            elif op4 in (0xD, 0xE, 0xF) and VEC:
+                ex = {0xD: '_mm_sub_ps(PS(c), vmul_spu(PS(a), PS(b)))', 0xE: '_mm_add_ps(vmul_spu(PS(a), PS(b)), PS(c))', 0xF: '_mm_sub_ps(vmul_spu(PS(a), PS(b)), PS(c))'}[op4]
+                s = f'{{ const __m128i a = V({A}), b = V({Bq}), c = V({Cq}); r[{rT}] = mk(IS({ex})); }}'
+            elif op4 == 0x8:
                 s = f'{{ Q t; for (int i = 0; i < 4; ++i) t.w[i] = ({A}.w[i] & ~{Cq}.w[i]) | ({Bq}.w[i] & {Cq}.w[i]); r[{rT}] = t; }}'
             elif op4 == 0xB:
                 s = f'r[{rT}] = shufb({A}, {Bq}, {Cq});'
@@ -208,6 +213,26 @@ def gen_lines(code, base, size, slow, leaders):
             0x5D: Hh(f'h(a, i) > 0x{u10 & 0xffff:x} ? 0xffff : 0'),
             0x5E: Bb(f'b(a, i) > 0x{u10 & 0xff:x} ? 0xff : 0'),
         }
+        if VEC:
+            def V1(expr):
+                return f'{{ const __m128i a = V({A}); {T} = mk({expr}); }}'
+            w32, s32 = f'_mm_set1_epi32(int(0x{u10:x}u))', f'_mm_set1_epi32(int(0x{u10 ^ 0x80000000:x}u))'
+            h16, b8 = f'_mm_set1_epi16(short(0x{u10 & 0xffff:x}))', f'_mm_set1_epi8(char(0x{u10 & 0xff:x}))'
+            vri10 = {
+                0x1C: V1(f'_mm_add_epi32(a, {w32})'), 0x0C: V1(f'_mm_sub_epi32({w32}, a)'),
+                0x1D: V1(f'_mm_add_epi16(a, {h16})'), 0x0D: V1(f'_mm_sub_epi16({h16}, a)'),
+                0x14: V1(f'_mm_and_si128(a, {w32})'), 0x15: V1(f'_mm_and_si128(a, {h16})'), 0x16: V1(f'_mm_and_si128(a, {b8})'),
+                0x04: V1(f'_mm_or_si128(a, {w32})'), 0x05: V1(f'_mm_or_si128(a, {h16})'), 0x06: V1(f'_mm_or_si128(a, {b8})'),
+                0x44: V1(f'_mm_xor_si128(a, {w32})'), 0x45: V1(f'_mm_xor_si128(a, {h16})'), 0x46: V1(f'_mm_xor_si128(a, {b8})'),
+                0x7C: V1(f'_mm_cmpeq_epi32(a, {w32})'), 0x7D: V1(f'_mm_cmpeq_epi16(a, {h16})'), 0x7E: V1(f'_mm_cmpeq_epi8(a, {b8})'),
+                0x4C: V1(f'_mm_cmpgt_epi32(a, {w32})'), 0x4D: V1(f'_mm_cmpgt_epi16(a, {h16})'), 0x4E: V1(f'_mm_cmpgt_epi8(a, {b8})'),
+                0x5C: V1(f'_mm_cmpgt_epi32(_mm_xor_si128(a, _mm_set1_epi32(int(0x80000000u))), {s32})'),
+                0x5D: V1(f'_mm_cmpgt_epi16(_mm_xor_si128(a, _mm_set1_epi16(short(0x8000))), _mm_set1_epi16(short(0x{(u10 & 0xffff) ^ 0x8000:x})))'),
+                0x5E: V1(f'_mm_cmpgt_epi8(_mm_xor_si128(a, _mm_set1_epi8(char(0x80))), _mm_set1_epi8(char(0x{(u10 & 0xff) ^ 0x80:x})))'),
+            }
+            if op8 in vri10:
+                E('  ' + vri10[op8])
+                return
         if op8 in ri10:
             E('  ' + ri10[op8])
             return
@@ -372,6 +397,46 @@ def gen_lines(code, base, size, slow, leaders):
                 cond = {0x3D8: f'{A}.w[0] == {Bq}.w[0]', 0x258: f'int32_t({A}.w[0]) > int32_t({Bq}.w[0])', 0x2D8: f'{A}.w[0] > {Bq}.w[0]'}[op11]
                 E(f'  if ({cond}) ' + exit_here)
             return
+        if VEC:
+            def V2(expr):
+                return f'{{ const __m128i a = V({A}), b = V({Bq}); {T} = mk({expr}); }}'
+            ones, S = '_mm_set1_epi32(-1)', '_mm_set1_epi32(int(0x80000000u))'
+            ugt = lambda x, y: f'_mm_cmpgt_epi32(_mm_xor_si128({x}, {S}), _mm_xor_si128({y}, {S}))'
+            n_shl, n_shr = u7 & 0x3f, (-i7) & 0x3f
+            h_shl, h_shr = u7 & 0x1f, (-i7) & 0x1f
+            rot = u7 & 31
+            vrr = {
+                0x0C0: V2('_mm_add_epi32(a, b)'), 0x040: V2('_mm_sub_epi32(b, a)'),
+                0x0C8: V2('_mm_add_epi16(a, b)'), 0x048: V2('_mm_sub_epi16(b, a)'),
+                0x0C2: V2('_mm_srli_epi32(' + ugt('a', '_mm_add_epi32(a, b)') + ', 31)'),
+                0x042: V2('_mm_andnot_si128(' + ugt('a', 'b') + ', _mm_set1_epi32(1))'),
+                0x0C1: V2('_mm_and_si128(a, b)'), 0x2C1: V2('_mm_andnot_si128(b, a)'),
+                0x041: V2('_mm_or_si128(a, b)'), 0x2C9: V2(f'_mm_or_si128(a, _mm_xor_si128(b, {ones}))'),
+                0x241: V2('_mm_xor_si128(a, b)'), 0x0C9: V2(f'_mm_xor_si128(_mm_and_si128(a, b), {ones})'),
+                0x049: V2(f'_mm_xor_si128(_mm_or_si128(a, b), {ones})'), 0x249: V2(f'_mm_xor_si128(_mm_xor_si128(a, b), {ones})'),
+                0x05B: V2('_mm_sllv_epi32(a, _mm_and_si128(b, _mm_set1_epi32(0x3f)))'),
+                0x059: V2('_mm_srlv_epi32(a, _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), b), _mm_set1_epi32(0x3f)))'),
+                0x05A: V2('_mm_srav_epi32(a, _mm_and_si128(_mm_sub_epi32(_mm_setzero_si128(), b), _mm_set1_epi32(0x3f)))'),
+                0x07B: V2('_mm_setzero_si128()' if n_shl > 31 else f'_mm_slli_epi32(a, {n_shl})'),
+                0x079: V2('_mm_setzero_si128()' if n_shr > 31 else f'_mm_srli_epi32(a, {n_shr})'),
+                0x07A: V2(f'_mm_srai_epi32(a, {min(n_shr, 31)})'),
+                0x07F: V2('_mm_setzero_si128()' if h_shl > 15 else f'_mm_slli_epi16(a, {h_shl})'),
+                0x07D: V2('_mm_setzero_si128()' if h_shr > 15 else f'_mm_srli_epi16(a, {h_shr})'),
+                0x07E: V2(f'_mm_srai_epi16(a, {min(h_shr, 15)})'),
+                0x078: V2('a' if rot == 0 else f'_mm_or_si128(_mm_slli_epi32(a, {rot}), _mm_srli_epi32(a, {32 - rot}))'),
+                0x3C0: V2('_mm_cmpeq_epi32(a, b)'), 0x3C8: V2('_mm_cmpeq_epi16(a, b)'), 0x3D0: V2('_mm_cmpeq_epi8(a, b)'),
+                0x240: V2('_mm_cmpgt_epi32(a, b)'), 0x248: V2('_mm_cmpgt_epi16(a, b)'), 0x250: V2('_mm_cmpgt_epi8(a, b)'),
+                0x2C0: V2(ugt('a', 'b')),
+                0x2C8: V2('_mm_cmpgt_epi16(_mm_xor_si128(a, _mm_set1_epi16(short(0x8000))), _mm_xor_si128(b, _mm_set1_epi16(short(0x8000))))'),
+                0x2D0: V2('_mm_cmpgt_epi8(_mm_xor_si128(a, _mm_set1_epi8(char(0x80))), _mm_xor_si128(b, _mm_set1_epi8(char(0x80))))'),
+                0x2C4: V2('IS(_mm_add_ps(PS(a), PS(b)))'), 0x2C5: V2('IS(_mm_sub_ps(PS(a), PS(b)))'),
+                0x2C6: V2('IS(vmul_spu(PS(a), PS(b)))'),
+                0x3C2: V2('IS(_mm_cmpeq_ps(PS(a), PS(b)))'), 0x2C2: V2('IS(_mm_cmpgt_ps(PS(a), PS(b)))'),
+                0x3CA: V2('IS(_mm_cmpeq_ps(PS(vabs(a)), PS(vabs(b))))'), 0x2CA: V2('IS(_mm_cmpgt_ps(PS(vabs(a)), PS(vabs(b))))'),
+            }
+            if op11 in vrr:
+                E('  ' + vrr[op11])
+                return
         if op11 in rr:
             if rr[op11]:
                 E('  ' + rr[op11])
@@ -384,6 +449,9 @@ def gen_lines(code, base, size, slow, leaders):
             E(f'  if (single) return 0x{(base + 4 * k + 4) & 0x3ffff:x}u;')
     starts.append(len(lines))
     return lines, starts
+
+
+VEC = os.environ.get('SPUVEC', '1') != '0'   # whole-quadword SSE/AVX2 templates for the common ops
 
 
 def gen(read, ea, size, base):
@@ -447,6 +515,7 @@ def gen(read, ea, size, base):
              '    uint64_t n = 0;',
              f'    while (pc >= 0x{base:x}u && pc < 0x{end:x}u) {{',
              '        ++n;',
+             f'        if (HleHook h = g_spuHle[(0x{ea:x}u >> 4) % 64]; h && spu_hle_wants((0x{ea:x}u >> 4) % 64, pc)) {{ pc = h(r, s, pc); if (pc < 0x{base:x}u || pc >= 0x{end:x}u) break; }}',
              f'        const uint32_t c = (pc - 0x{base:x}u) >> 10;',
              f'        if (g_spuProf) ++g_spuProfCnt[(0x{ea:x}u >> 4) % 64][c & 255];',
              f'        pc = k_{fn}_fast[c](r, s, pc);',
@@ -492,7 +561,7 @@ def main():
     for (ea, base, size, fn) in table:
         t.append(f'void {fn}(Spu& s);')
         t.append(f'extern const SlowChunk k_{fn}_slow[];')
-    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;']
+    t += ['', 'bool g_spuProf = false;', 'uint64_t g_spuProfCnt[64][256];', 'uint64_t g_spuSlowEntries = 0;', 'HleHook g_spuHle[64];', 'uint32_t g_spuHlePcs[64][8];']
     t += ['', 'static const Compiled k_table[] = {']
     for (ea, base, size, fn) in table:
         t.append(f'    {{0x{ea:x}, 0x{base:x}, 0x{size:x}, {fn}, k_{fn}_slow}},')
