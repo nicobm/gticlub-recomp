@@ -46,27 +46,39 @@ export WINEDEBUG="${RACING_CLUB_WINEDEBUG:--all}"
 export SPUS="${SPUS:-4}"
 export SDL_AUDIO_DEVICE_SAMPLE_FRAMES="${SDL_AUDIO_DEVICE_SAMPLE_FRAMES:-1024}"
 
-# Por defecto usamos OpenGL por hardware. En una VM con virtio-gpu el host
-# expone la GPU real vía virgl, que anuncia OpenGL 4.3; el juego pide 4.5
-# core, así que subimos la versión anunciada. Es la única variable de Mesa
-# que hace falta. En una GPU real no se toca nada.
+# Detectamos la GPU virtual de la VM: virtio-gpu, cuyo OpenGL lo da virgl.
+# virgl no aparece como dispositivo aparte en /sys; su marca es justamente el
+# nodo virtio-gpu. Con una GPU real (aunque esté pasada a la VM) no hay nodo
+# virtio. RACING_CLUB_VIRTIO=1 fuerza este modo si /sys no es legible.
+IS_VIRTIO=0
+if [ "${RACING_CLUB_VIRTIO:-0}" = "1" ] ||
+    grep -qi 'virtio' /sys/class/drm/card*/device/uevent 2>/dev/null; then
+    IS_VIRTIO=1
+fi
+
+# Renderizador: en virtio-gpu/virgl, OpenGL (virgl anuncia 4.3 y el juego pide
+# 4.5 core, así que subimos la versión anunciada); en una GPU real, Vulkan.
+# Si Vulkan no está disponible, el juego vuelve solo a OpenGL.
+# RENDERER=gl|vulkan|d3d11 (o --env=RENDERER=...) tiene la última palabra.
 # RACING_CLUB_SOFTWARE_GL=1 fuerza llvmpipe.
-# RACING_CLUB_VIRTIO=1 fuerza el modo virtio si /sys no es legible.
 if [ "${RACING_CLUB_SOFTWARE_GL:-0}" = "1" ]; then
     export LIBGL_ALWAYS_SOFTWARE=1
+    export RENDERER="${RENDERER:-gl}"
     echo "Racing Club+: OpenGL por software (llvmpipe)."
+elif [ "$IS_VIRTIO" = "1" ]; then
+    export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-4.5}"
+    export RENDERER="${RENDERER:-gl}"
+    # La VM no ofrece Vulkan (Venus hay que habilitarlo en QEMU): apagamos los
+    # ICDs para que la enumeración de DXGI al arrancar no llene la terminal.
+    export VK_DRIVER_FILES="${VK_DRIVER_FILES-/nonexistent}"
+    echo "Racing Club+: OpenGL por hardware (virtio/virgl)."
 else
-    IS_VIRTIO=0
-    if [ "${RACING_CLUB_VIRTIO:-0}" = "1" ] ||
-        grep -qi 'virtio' /sys/class/drm/card0/device/uevent 2>/dev/null; then
-        IS_VIRTIO=1
-    fi
-    if [ "$IS_VIRTIO" = "1" ]; then
-        export MESA_GL_VERSION_OVERRIDE="${MESA_GL_VERSION_OVERRIDE:-4.5}"
-        echo "Racing Club+: OpenGL por hardware (virtio/virgl)."
-    else
-        echo "Racing Club+: OpenGL por hardware."
-    fi
+    export RENDERER="${RENDERER:-vulkan}"
+    case "$RENDERER" in
+        gl)     echo "Racing Club+: OpenGL por hardware." ;;
+        vulkan) echo "Racing Club+: Vulkan (vuelve a OpenGL si no está disponible)." ;;
+        *)      echo "Racing Club+: $RENDERER (vuelve a OpenGL si no está disponible)." ;;
+    esac
 fi
 
 # El glcache del paquete es de la GPU del autor; en otra GPU los binarios se
@@ -89,8 +101,13 @@ if [ -z "${WAYLAND_DISPLAY:-}" ]; then
 fi
 echo "Racing Club+: Wine sobre Wayland."
 
-# El juego usa OpenGL. winevulkan=d evita que Wine intente radv/Vulkan.
-export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d}"
+# Vulkan solo se deja disponible si el renderizador elegido lo va a usar.
+# En OpenGL (virtio/virgl o software) winevulkan=d evita que Wine lo intente.
+case "${RENDERER:-}" in
+    gl) DEF_OVERRIDES="mscoree=d;mshtml=d;winevulkan=d;vulkan-1=d" ;;
+    *)  DEF_OVERRIDES="mscoree=d;mshtml=d" ;;
+esac
+export WINEDLLOVERRIDES="${RACING_CLUB_WINEDLLOVERRIDES:-$DEF_OVERRIDES}"
 
 if [ -x /app/bin/wine ]; then WINE=/app/bin/wine; else WINE=wine; fi
 if [ -x /app/bin/wineboot ]; then WINEBOOT=/app/bin/wineboot; else WINEBOOT=wineboot; fi

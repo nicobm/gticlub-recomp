@@ -178,13 +178,14 @@ rm -rf ~/.var/app/io.github.nicobm.GtiClubRecomp
 - El `.rar`/`.zip` del ROM no se usa para este camino: el paquete de Patreon
   ya trae `juego/EBOOT.elf` y `juego/USRDIR`. Se acepta como argumento para
   que puedas pasarlo, pero no se extrae.
-- El juego usa **OpenGL**, no Vulkan. Wine lo mantiene desactivado con
-  `WINEDLLOVERRIDES` (`winevulkan=d;vulkan-1=d`) para que `radv` no llene la
-  terminal con `vdrm_device_connect failed`.
-- El lanzador usa **OpenGL por hardware** por defecto. En una VM con
-  `virtio-gpu`/virgl detecta el dispositivo y aplica
+- El lanzador elige el **renderizador** según la GPU: **OpenGL** en una VM
+  con `virtio-gpu`/virgl y **Vulkan** en una GPU real (si Vulkan 1.3 no está
+  disponible, el juego vuelve solo a OpenGL). En virtio/virgl aplica
   `MESA_GL_VERSION_OVERRIDE=4.5` (virgl anuncia 4.3 y el juego pide 4.5
-  core). Es la única variable de Mesa necesaria. Para forzar software:
+  core) y apaga los ICDs de Vulkan, porque la VM no tiene Vulkan salvo que se
+  habilite Venus en QEMU. Para elegir a mano:
+  `--env=RENDERER=gl`, `vulkan` o `d3d11` (tiene prioridad sobre el menú F1).
+  Para forzar software:
   ```sh
   flatpak run --user --env=RACING_CLUB_SOFTWARE_GL=1 \
       io.github.nicobm.GtiClubRecomp
